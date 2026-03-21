@@ -1,0 +1,8 @@
+/target
+
+# UI
+ui/node_modules/
+ui/dist/
+ui/.playwright-cli/
+*.png
+*.pdf
