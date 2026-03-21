@@ -92,4 +92,46 @@ impl ProviderManager {
             provider.mark_failure();
         }
     }
+
+    pub fn reset(&self, name: &str) {
+        if let Some(provider) = self.providers.get(name) {
+            provider.reset();
+        }
+    }
+
+    pub fn get_all_states(&self) -> Vec<ProviderStatus> {
+        self.providers
+            .iter()
+            .map(|entry| {
+                let state = entry.value().state.lock().unwrap();
+                let state_str = match &*state {
+                    ProviderState::Healthy => "healthy",
+                    ProviderState::Cooldown { until } => {
+                        if chrono::Utc::now() < *until {
+                            "cooldown"
+                        } else {
+                            "healthy"
+                        }
+                    }
+                    ProviderState::Unhealthy { recovery_at } => {
+                        if chrono::Utc::now() < *recovery_at {
+                            "unhealthy"
+                        } else {
+                            "healthy"
+                        }
+                    }
+                };
+                ProviderStatus {
+                    name: entry.key().clone(),
+                    state: state_str.to_string(),
+                }
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ProviderStatus {
+    pub name: String,
+    pub state: String,
 }

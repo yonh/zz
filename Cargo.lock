@@ -2036,6 +2036,7 @@ dependencies = [
  "rustls-native-certs",
  "serde",
  "serde_derive",
+ "serde_json",
  "thiserror",
  "tokio",
  "tokio-rustls",
