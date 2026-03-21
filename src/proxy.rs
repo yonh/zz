@@ -30,7 +30,14 @@ pub async fn proxy_handler(
         .map_err(|e| crate::error::ProxyError::RequestError(e.to_string()))?
         .to_bytes();
 
-    let max_retries = state.config.routing.max_retries;
+    let max_retries = {
+        let config = state.config.read().unwrap();
+        config.routing.max_retries
+    };
+    let request_timeout_secs = {
+        let config = state.config.read().unwrap();
+        config.server.request_timeout_secs
+    };
     let mut tried_providers: HashSet<String> = HashSet::new();
     let mut last_error: Option<crate::error::ProxyError> = None;
 
@@ -71,6 +78,7 @@ pub async fn proxy_handler(
             &body_bytes,
             &state,
             is_sse,
+            request_timeout_secs,
         ).await {
             Ok(response) => return Ok(response),
             Err(e) => {
@@ -116,6 +124,7 @@ async fn attempt_request(
     body_bytes: &Bytes,
     state: &AppState,
     is_sse: bool,
+    request_timeout_secs: u64,
 ) -> Result<hyper::Response<ResponseBody>, crate::error::ProxyError> {
     // Rewrite URL
     let upstream_url = crate::rewriter::RequestRewriter::rewrite_url(
@@ -152,7 +161,7 @@ async fn attempt_request(
         .enable_http1()
         .build();
 
-    let timeout = std::time::Duration::from_secs(state.config.server.request_timeout_secs);
+    let timeout = std::time::Duration::from_secs(request_timeout_secs);
 
     let client: hyper_util::client::legacy::Client<_, Full<Bytes>> =
         hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
@@ -252,5 +261,25 @@ async fn attempt_request(
 pub struct AppState {
     pub provider_manager: Arc<crate::provider::ProviderManager>,
     pub router: Arc<crate::router::Router>,
-    pub config: Arc<crate::config::Config>,
+    pub config: Arc<std::sync::RwLock<crate::config::Config>>,
+    pub config_path: String,
+}
+
+impl AppState {
+    pub fn reload_config(&self) -> Result<(), String> {
+        let new_config = crate::config::Config::load(&self.config_path)
+            .map_err(|e| format!("Failed to load config: {}", e))?;
+
+        // Update provider manager
+        self.provider_manager.reload(&new_config);
+
+        // Update config
+        {
+            let mut config = self.config.write().unwrap();
+            *config = new_config;
+        }
+
+        tracing::info!("Config reloaded successfully");
+        Ok(())
+    }
 }

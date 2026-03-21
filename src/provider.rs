@@ -53,7 +53,7 @@ impl Provider {
 
 pub struct ProviderManager {
     providers: DashMap<String, Arc<Provider>>,
-    health_config: crate::config::HealthConfig,
+    health_config: std::sync::RwLock<crate::config::HealthConfig>,
 }
 
 impl ProviderManager {
@@ -65,7 +65,7 @@ impl ProviderManager {
         }
         Self {
             providers,
-            health_config: config.health.clone(),
+            health_config: std::sync::RwLock::new(config.health.clone()),
         }
     }
 
@@ -83,7 +83,8 @@ impl ProviderManager {
 
     pub fn mark_quota_exhausted(&self, name: &str) {
         if let Some(provider) = self.providers.get(name) {
-            provider.mark_quota_exhausted(self.health_config.cooldown_secs);
+            let cooldown_secs = self.health_config.read().unwrap().cooldown_secs;
+            provider.mark_quota_exhausted(cooldown_secs);
         }
     }
 
@@ -127,6 +128,41 @@ impl ProviderManager {
                 }
             })
             .collect()
+    }
+pub fn reload(&self, config: &crate::config::Config) {
+        // Update health config
+        *self.health_config.write().unwrap() = config.health.clone();
+
+        // Get current provider names
+        let current_names: std::collections::HashSet<_> = self.providers.iter()
+            .map(|entry| entry.key().clone())
+            .collect();
+
+        // Get new provider names
+        let new_names: std::collections::HashSet<_> = config.provider_configs.iter()
+            .map(|p| p.name.clone())
+            .collect();
+
+        // Remove providers that no longer exist
+        for name in current_names.difference(&new_names) {
+            self.providers.remove(name);
+            tracing::info!(provider = %name, "Removed provider");
+        }
+
+        // Add or update providers
+        for provider_config in &config.provider_configs {
+            if self.providers.contains_key(&provider_config.name) {
+                // Update existing provider's config - need to replace the whole provider
+                let provider = Arc::new(Provider::new(provider_config.clone()));
+                self.providers.insert(provider_config.name.clone(), provider);
+                tracing::info!(provider = %provider_config.name, "Updated provider config");
+            } else {
+                // Add new provider
+                let provider = Arc::new(Provider::new(provider_config.clone()));
+                self.providers.insert(provider_config.name.clone(), provider);
+                tracing::info!(provider = %provider_config.name, "Added new provider");
+            }
+        }
     }
 }
 

@@ -67,17 +67,45 @@ fn handle_stats(_state: Option<&super::proxy::AppState>) -> hyper::Response<Resp
     resp
 }
 
-fn handle_reload(_state: Option<&super::proxy::AppState>) -> hyper::Response<ResponseBody> {
-    // TODO: Implement actual config reload
-    let body = serde_json::to_string(&serde_json::json!({
-        "reloaded": false,
-        "message": "Not implemented yet"
-    })).unwrap();
-
-    let mut resp = hyper::Response::new(full(body));
-    resp.headers_mut().insert(
-        hyper::header::CONTENT_TYPE,
-        "application/json".parse().unwrap(),
-    );
-    resp
+fn handle_reload(state: Option<&super::proxy::AppState>) -> hyper::Response<ResponseBody> {
+    if let Some(s) = state {
+        match s.reload_config() {
+            Ok(()) => {
+                let body = serde_json::to_string(&serde_json::json!({
+                    "reloaded": true,
+                    "message": "Config reloaded successfully"
+                })).unwrap();
+                let mut resp = hyper::Response::new(full(body));
+                resp.headers_mut().insert(
+                    hyper::header::CONTENT_TYPE,
+                    "application/json".parse().unwrap(),
+                );
+                resp
+            }
+            Err(e) => {
+                let body = serde_json::to_string(&serde_json::json!({
+                    "reloaded": false,
+                    "error": e
+                })).unwrap();
+                let mut resp = hyper::Response::new(full(body));
+                resp.headers_mut().insert(
+                    hyper::header::CONTENT_TYPE,
+                    "application/json".parse().unwrap(),
+                );
+                *resp.status_mut() = hyper::StatusCode::INTERNAL_SERVER_ERROR;
+                resp
+            }
+        }
+    } else {
+        let body = serde_json::to_string(&serde_json::json!({
+            "reloaded": false,
+            "error": "State not available"
+        })).unwrap();
+        let mut resp = hyper::Response::new(full(body));
+        resp.headers_mut().insert(
+            hyper::header::CONTENT_TYPE,
+            "application/json".parse().unwrap(),
+        );
+        resp
+    }
 }

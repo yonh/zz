@@ -58,16 +58,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create shared state
     let provider_manager = Arc::new(provider::ProviderManager::new(&cfg));
     let router = Arc::new(router::Router::new(&cfg.routing.strategy));
-    let config = Arc::new(cfg);
 
     let state = proxy::AppState {
         provider_manager,
         router,
-        config,
+        config: Arc::new(std::sync::RwLock::new(cfg)),
+        config_path: args.config.clone(),
     };
 
     // Create server
-    let addr: std::net::SocketAddr = state.config.server.listen.parse()?;
+    let addr: std::net::SocketAddr = {
+        let config = state.config.read().unwrap();
+        config.server.listen.parse()?
+    };
     let listener = tokio::net::TcpListener::bind(addr).await?;
 
     tracing::info!("Listening on {}", addr);
