@@ -5,10 +5,16 @@
 
 # Cargo
 # Note: Cargo.lock should be committed for binaries, ignored for libraries
+.cargo/config.toml
 
 # Config (contains sensitive API keys)
 config.toml
-!.config.toml.example
+!config.toml.example
+
+# Environment
+.env
+.env.local
+.env.*.local
 
 # Logs
 *.log
@@ -20,6 +26,10 @@ logs/
 *.swp
 *.swo
 *~
+*.iml
+.project
+.classpath
+.settings/
 
 # OS
 .DS_Store
@@ -29,32 +39,55 @@ logs/
 .Trashes
 Thumbs.db
 ehthumbs.db
+desktop.ini
 
 # UI (Node.js / TypeScript)
 ui/node_modules/
 ui/dist/
+ui/build/
 ui/.vite/
 ui/.turbo/
+ui/.next/
+ui/.nuxt/
 ui/.playwright-cli/
 ui/.env
 ui/.env.local
 ui/.env.*.local
+ui/coverage/
+ui/.nyc_output/
+
+# Database
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
 
 # Binary files
 *.png
 *.jpg
 *.jpeg
 *.gif
+*.ico
 *.pdf
 *.zip
 *.tar.gz
+*.rar
+*.7z
 
 # Test coverage
 coverage/
 .nyc_output/
+*.lcov
 
 # Temporary files
 tmp/
 temp/
 *.tmp
 *.temp
+*.bak
+*.backup
+
+# Debug
+debug/
+.vscode/launch.json
