@@ -10,8 +10,16 @@ mod logging;
 
 use clap::Parser;
 use std::sync::Arc;
-use http_body_util::{BodyExt, Full};
+use http_body_util::BodyExt;
 use hyper::body::Bytes;
+
+type ResponseBody = http_body_util::combinators::BoxBody<Bytes, hyper::Error>;
+
+fn full<T: Into<Bytes>>(chunk: T) -> ResponseBody {
+    http_body_util::Full::new(chunk.into())
+        .map_err(|never| match never {})
+        .boxed()
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "zz")]
@@ -99,7 +107,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     tracing::error!(error = ?e, "Proxy error");
                                     Ok(hyper::Response::builder()
                                         .status(hyper::StatusCode::INTERNAL_SERVER_ERROR)
-                                        .body(Full::from(format!("Proxy error: {}", e)))
+                                        .body(full(format!("Proxy error: {}", e)))
                                         .unwrap())
                                 }
                             }

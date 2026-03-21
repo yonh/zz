@@ -1,9 +1,19 @@
 use std::sync::Arc;
+use http_body_util::{BodyExt, Full, combinators::BoxBody};
+use hyper::body::Bytes;
+
+type ResponseBody = BoxBody<Bytes, hyper::Error>;
+
+fn full<T: Into<Bytes>>(chunk: T) -> ResponseBody {
+    Full::new(chunk.into())
+        .map_err(|never| match never {})
+        .boxed()
+}
 
 pub fn handle_admin_request(
     req: &hyper::Request<hyper::body::Incoming>,
     state: Option<&super::proxy::AppState>,
-) -> Option<hyper::Response<http_body_util::Full<bytes::Bytes>>> {
+) -> Option<hyper::Response<ResponseBody>> {
     let path = req.uri().path();
 
     if !path.starts_with("/zz/") {
@@ -15,15 +25,14 @@ pub fn handle_admin_request(
         ("/zz/stats", &hyper::Method::GET) => Some(handle_stats(state)),
         ("/zz/reload", &hyper::Method::POST) => Some(handle_reload(state)),
         _ => {
-            let body = http_body_util::Full::from("Not found");
-            let mut resp = hyper::Response::new(body);
+            let mut resp = hyper::Response::new(full("Not found"));
             *resp.status_mut() = hyper::StatusCode::NOT_FOUND;
             Some(resp)
         }
     }
 }
 
-fn handle_health(state: Option<&super::proxy::AppState>) -> hyper::Response<http_body_util::Full<bytes::Bytes>> {
+fn handle_health(state: Option<&super::proxy::AppState>) -> hyper::Response<ResponseBody> {
     let body = if let Some(s) = state {
         let providers = s.provider_manager.get_all_states();
         serde_json::to_string(&serde_json::json!({
@@ -34,7 +43,7 @@ fn handle_health(state: Option<&super::proxy::AppState>) -> hyper::Response<http
         "{\"status\":\"ok\"}".to_string()
     };
 
-    let mut resp = hyper::Response::new(http_body_util::Full::from(body));
+    let mut resp = hyper::Response::new(full(body));
     resp.headers_mut().insert(
         hyper::header::CONTENT_TYPE,
         "application/json".parse().unwrap(),
@@ -42,7 +51,7 @@ fn handle_health(state: Option<&super::proxy::AppState>) -> hyper::Response<http
     resp
 }
 
-fn handle_stats(_state: Option<&super::proxy::AppState>) -> hyper::Response<http_body_util::Full<bytes::Bytes>> {
+fn handle_stats(_state: Option<&super::proxy::AppState>) -> hyper::Response<ResponseBody> {
     // TODO: Implement actual stats tracking
     let body = serde_json::to_string(&serde_json::json!({
         "requests": 0,
@@ -50,7 +59,7 @@ fn handle_stats(_state: Option<&super::proxy::AppState>) -> hyper::Response<http
         "providers": []
     })).unwrap();
 
-    let mut resp = hyper::Response::new(http_body_util::Full::from(body));
+    let mut resp = hyper::Response::new(full(body));
     resp.headers_mut().insert(
         hyper::header::CONTENT_TYPE,
         "application/json".parse().unwrap(),
@@ -58,14 +67,14 @@ fn handle_stats(_state: Option<&super::proxy::AppState>) -> hyper::Response<http
     resp
 }
 
-fn handle_reload(_state: Option<&super::proxy::AppState>) -> hyper::Response<http_body_util::Full<bytes::Bytes>> {
+fn handle_reload(_state: Option<&super::proxy::AppState>) -> hyper::Response<ResponseBody> {
     // TODO: Implement actual config reload
     let body = serde_json::to_string(&serde_json::json!({
         "reloaded": false,
         "message": "Not implemented yet"
     })).unwrap();
 
-    let mut resp = hyper::Response::new(http_body_util::Full::from(body));
+    let mut resp = hyper::Response::new(full(body));
     resp.headers_mut().insert(
         hyper::header::CONTENT_TYPE,
         "application/json".parse().unwrap(),

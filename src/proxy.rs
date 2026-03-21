@@ -1,14 +1,26 @@
 use std::sync::Arc;
-use http_body_util::{BodyExt, Full};
-use hyper::body::Bytes;
+use http_body_util::{BodyExt, Full, combinators::BoxBody, StreamBody};
+use hyper::body::{Bytes, Frame, Incoming};
 use std::collections::HashSet;
+use futures_util::TryStreamExt;
+
+type ResponseBody = BoxBody<Bytes, hyper::Error>;
+
+fn full<T: Into<Bytes>>(chunk: T) -> ResponseBody {
+    Full::new(chunk.into())
+        .map_err(|never| match never {})
+        .boxed()
+}
 
 pub async fn proxy_handler(
-    req: hyper::Request<hyper::body::Incoming>,
+    req: hyper::Request<Incoming>,
     state: AppState,
-) -> Result<hyper::Response<Full<Bytes>>, crate::error::ProxyError> {
+) -> Result<hyper::Response<ResponseBody>, crate::error::ProxyError> {
     let path = req.uri().path().to_string();
     let method = req.method().clone();
+
+    // Detect SSE request
+    let is_sse = is_sse_request(&req);
 
     // Collect request headers upfront
     let headers = req.headers().clone();
@@ -45,6 +57,7 @@ pub async fn proxy_handler(
             provider = %provider_name,
             method = %method,
             path = %path,
+            is_sse = is_sse,
             "Selected provider for request"
         );
 
@@ -57,6 +70,7 @@ pub async fn proxy_handler(
             &headers,
             &body_bytes,
             &state,
+            is_sse,
         ).await {
             Ok(response) => return Ok(response),
             Err(e) => {
@@ -77,8 +91,20 @@ pub async fn proxy_handler(
 
     Ok(hyper::Response::builder()
         .status(hyper::StatusCode::SERVICE_UNAVAILABLE)
-        .body(Full::from(error_msg))
+        .body(full(error_msg))
         .unwrap())
+}
+
+fn is_sse_request(req: &hyper::Request<Incoming>) -> bool {
+    // Check Accept header
+    if let Some(accept) = req.headers().get(hyper::header::ACCEPT) {
+        if let Ok(accept_str) = accept.to_str() {
+            if accept_str.contains("text/event-stream") {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 async fn attempt_request(
@@ -89,7 +115,8 @@ async fn attempt_request(
     headers: &hyper::HeaderMap,
     body_bytes: &Bytes,
     state: &AppState,
-) -> Result<hyper::Response<Full<Bytes>>, crate::error::ProxyError> {
+    is_sse: bool,
+) -> Result<hyper::Response<ResponseBody>, crate::error::ProxyError> {
     // Rewrite URL
     let upstream_url = crate::rewriter::RequestRewriter::rewrite_url(
         &provider.config.base_url,
@@ -114,7 +141,7 @@ async fn attempt_request(
     }
 
     let upstream_req = upstream_req_builder
-        .body(Full::from(body_bytes.clone()))
+        .body(Full::new(body_bytes.clone()))
         .map_err(|e| crate::error::ProxyError::RequestError(e.to_string()))?;
 
     // Create HTTP client with timeout
@@ -133,7 +160,7 @@ async fn attempt_request(
             .build(https);
 
     // Send request to upstream with timeout
-    tracing::debug!(url = %upstream_url, "Sending request to upstream");
+    tracing::debug!(url = %upstream_url, is_sse = is_sse, "Sending request to upstream");
 
     let response = tokio::time::timeout(
         timeout,
@@ -145,50 +172,80 @@ async fn attempt_request(
     let status = response.status();
     let response_headers = response.headers().clone();
 
-    // Collect response body
-    let response_bytes = response.collect().await
-        .map_err(|e| crate::error::ProxyError::HttpError(e.to_string()))?
-        .to_bytes();
+    // For non-2xx responses, check for errors
+    if !status.is_success() {
+        // Collect response body for error checking
+        let response_bytes = response.collect().await
+            .map_err(|e| crate::error::ProxyError::HttpError(e.to_string()))?
+            .to_bytes();
 
-    // Check for quota errors (inspect body for 403)
-    let is_quota = if status == hyper::StatusCode::TOO_MANY_REQUESTS {
-        true
-    } else if status == hyper::StatusCode::FORBIDDEN {
-        // Check body for quota keywords
-        crate::error::is_quota_error(status, &response_bytes)
+        // Check for quota errors (inspect body for 403)
+        let is_quota = if status == hyper::StatusCode::TOO_MANY_REQUESTS {
+            true
+        } else if status == hyper::StatusCode::FORBIDDEN {
+            crate::error::is_quota_error(status, &response_bytes)
+        } else {
+            false
+        };
+
+        if is_quota {
+            tracing::warn!(provider = %provider_name, "Quota exhausted, marking provider as cooldown");
+            state.provider_manager.mark_quota_exhausted(provider_name);
+            return Err(crate::error::ProxyError::QuotaExhausted(provider_name.to_string()));
+        }
+
+        // Check for 5xx errors - should retry
+        if status.as_u16() >= 500 && status.as_u16() < 600 {
+            state.provider_manager.mark_failure(provider_name);
+            return Err(crate::error::ProxyError::HttpError(format!("Upstream error: {}", status)));
+        }
+
+        // Non-retryable error - return response
+        let mut downstream_response = hyper::Response::builder().status(status);
+        for (name, value) in response_headers.iter() {
+            downstream_response = downstream_response.header(name, value);
+        }
+
+        return Ok(downstream_response
+            .body(full(response_bytes))
+            .unwrap());
+    }
+
+    // Success response
+    state.provider_manager.reset(provider_name);
+
+    if is_sse {
+        // Stream response for SSE
+        tracing::info!("Streaming SSE response");
+
+        let stream = response.into_data_stream()
+            .map_ok(Frame::data);
+
+        let body = StreamBody::new(stream).boxed();
+
+        let mut downstream_response = hyper::Response::builder().status(status);
+        for (name, value) in response_headers.iter() {
+            downstream_response = downstream_response.header(name, value);
+        }
+
+        Ok(downstream_response
+            .body(body)
+            .unwrap())
     } else {
-        false
-    };
+        // Buffer response for non-SSE
+        let response_bytes = response.collect().await
+            .map_err(|e| crate::error::ProxyError::HttpError(e.to_string()))?
+            .to_bytes();
 
-    if is_quota {
-        tracing::warn!(provider = %provider_name, "Quota exhausted, marking provider as cooldown");
-        state.provider_manager.mark_quota_exhausted(provider_name);
-        return Err(crate::error::ProxyError::QuotaExhausted(provider_name.to_string()));
+        let mut downstream_response = hyper::Response::builder().status(status);
+        for (name, value) in response_headers.iter() {
+            downstream_response = downstream_response.header(name, value);
+        }
+
+        Ok(downstream_response
+            .body(full(response_bytes))
+            .unwrap())
     }
-
-    // Check for 5xx errors - should retry
-    if status.as_u16() >= 500 && status.as_u16() < 600 {
-        state.provider_manager.mark_failure(provider_name);
-        return Err(crate::error::ProxyError::HttpError(format!("Upstream error: {}", status)));
-    }
-
-    // Success or non-retryable error - return response
-    // Build downstream response
-    let mut downstream_response = hyper::Response::builder().status(status);
-    for (name, value) in response_headers.iter() {
-        downstream_response = downstream_response.header(name, value);
-    }
-
-    let response = downstream_response
-        .body(Full::from(response_bytes))
-        .unwrap();
-
-    // Mark provider as healthy on success
-    if status.is_success() {
-        state.provider_manager.reset(provider_name);
-    }
-
-    Ok(response)
 }
 
 #[derive(Clone)]
