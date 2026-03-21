@@ -41,9 +41,10 @@ listen = "127.0.0.1:9090"          # Local listen address
 # log_level = "info"               # trace | debug | info | warn | error
 
 [routing]
-strategy = "failover"              # failover | round-robin | weighted-random
+strategy = "failover"              # failover | round-robin | weighted-random | quota-aware | manual
 # retry_on_failure = true          # Retry current request on next provider if current fails
 # max_retries = 3                  # Max retry attempts per request
+# pinned_provider = ""             # (manual strategy only) Provider name to pin all traffic to
 
 # Health check: temporarily disable a provider after consecutive failures
 [health]
@@ -62,7 +63,8 @@ api_key = "sk-xxxx"
 # priority = 1                     # Lower = higher priority (used in failover strategy)
 # weight = 5                       # Relative weight (used in weighted-random strategy)
 # models = ["qwen-plus", "qwen-turbo"]  # Optional: only route requests for these models to this provider
-# headers = { "X-Custom" = "val" } # Optional: extra headers to inject
+# token_budget = 1000000           # Optional: monthly token budget (used in quota-aware strategy)
+# headers = { "X-Custom" = "val" } # Optional: extra headers to inject per provider
 
 [[providers]]
 name = "zhipu-account-1"
@@ -93,6 +95,15 @@ api_key = "sk-zzzz"
 ### 3. Weighted-Random
 - Random selection weighted by `weight` field
 - Skip unhealthy/cooldown providers
+
+### 4. Quota-Aware
+- Track token usage per provider (parsed from response `usage` field)
+- Switch to next provider when usage exceeds configured threshold (e.g., 90% of budget)
+- Requires per-provider `token_budget` configuration
+
+### 5. Manual / Fixed
+- Pin all traffic to one specific provider (configured via `pinned_provider` field)
+- No automatic failover; returns error if pinned provider is unavailable
 
 ## Failover Detection
 

@@ -28,6 +28,8 @@ export interface Provider {
   cooldown_until: string | null;
   consecutive_failures: number;
   stats: ProviderStats;
+  headers?: Record<string, string>;
+  token_budget?: number;
 }
 
 /**
@@ -82,6 +84,7 @@ export interface RoutingConfig {
   cooldown_secs: number;
   failure_threshold: number;
   recovery_secs: number;
+  pinned_provider?: string;
 }
 
 /**

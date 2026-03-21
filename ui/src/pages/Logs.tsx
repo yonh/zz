@@ -1,4 +1,4 @@
-import { useState, useMemo } from "react";
+import { useState, useMemo, useRef, useEffect } from "react";
 import {
   Search,
   Filter,
@@ -17,6 +17,7 @@ import { Select } from "@/components/ui/select";
 import { useAppStore } from "@/stores/store";
 import type { LogEntry } from "@/api/types";
 import { cn } from "@/lib/utils";
+import { toast } from "sonner";
 
 /**
  * Expandable log detail row.
@@ -90,6 +91,7 @@ export default function Logs() {
   const [searchQuery, setSearchQuery] = useState("");
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [autoScroll, setAutoScroll] = useState(true);
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
 
   const filteredLogs = useMemo(() => {
     return logs.filter((log) => {
@@ -124,6 +126,28 @@ export default function Logs() {
     ...providers.map((p) => ({ value: p.name, label: p.name })),
   ];
 
+  // Auto-scroll to top when new logs arrive and autoScroll is enabled
+  useEffect(() => {
+    if (autoScroll && scrollContainerRef.current) {
+      scrollContainerRef.current.scrollTop = 0;
+    }
+  }, [logs, autoScroll]);
+
+  /**
+   * Export filtered logs as JSON file download.
+   */
+  function handleExport() {
+    const data = JSON.stringify(filteredLogs, null, 2);
+    const blob = new Blob([data], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `zz-logs-${new Date().toISOString().slice(0, 19)}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+    toast.success(`Exported ${filteredLogs.length} log entries`);
+  }
+
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
@@ -145,7 +169,7 @@ export default function Logs() {
               </>
             )}
           </Button>
-          <Button variant="outline" size="sm" className="gap-1.5">
+          <Button variant="outline" size="sm" className="gap-1.5" onClick={handleExport}>
             <Download className="h-3.5 w-3.5" /> Export
           </Button>
         </div>
@@ -190,7 +214,7 @@ export default function Logs() {
           <CardTitle>Request Log</CardTitle>
         </CardHeader>
         <CardContent className="pt-4">
-          <div className="rounded-md border max-h-[600px] overflow-y-auto">
+          <div ref={scrollContainerRef} className="rounded-md border max-h-[600px] overflow-y-auto">
             {/* Header */}
             <div className="grid grid-cols-[24px_90px_56px_120px_1fr_70px_70px] gap-2 px-3 py-2 border-b bg-muted/50 text-xs font-medium text-muted-foreground sticky top-0 z-10">
               <span />

@@ -17,7 +17,7 @@ import {
   X,
   Save,
 } from "lucide-react";
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect } from "react";
 import {
   DndContext,
   closestCenter,
@@ -50,6 +50,31 @@ import type { Provider, ProviderStatus } from "@/api/types";
 import { cn } from "@/lib/utils";
 
 /**
+ * Live cooldown countdown timer.
+ */
+function CooldownCountdown({ until }: { until: string }) {
+  const [remaining, setRemaining] = useState("");
+
+  useEffect(() => {
+    function update() {
+      const diff = new Date(until).getTime() - Date.now();
+      if (diff <= 0) {
+        setRemaining("Recovering...");
+        return;
+      }
+      const secs = Math.floor(diff / 1000);
+      const mins = Math.floor(secs / 60);
+      setRemaining(mins > 0 ? `${mins}m ${secs % 60}s` : `${secs}s`);
+    }
+    update();
+    const timer = setInterval(update, 1000);
+    return () => clearInterval(timer);
+  }, [until]);
+
+  return <span>Quota exceeded. Recovers in {remaining}</span>;
+}
+
+/**
  * Map provider status to badge variant and icon.
  */
 function getStatusDisplay(status: ProviderStatus) {
@@ -66,6 +91,138 @@ function getStatusDisplay(status: ProviderStatus) {
 }
 
 /**
+ * Add modal for a new provider.
+ */
+function AddProviderModal({ onClose }: { onClose: () => void }) {
+  const providers = useAppStore((s) => s.providers);
+  const addProvider = useAppStore((s) => s.addProvider);
+  const [form, setForm] = useState({
+    name: "",
+    base_url: "",
+    api_key: "",
+    priority: providers.length + 1,
+    weight: 50,
+    models: "",
+  });
+  const [error, setError] = useState("");
+
+  function handleSave() {
+    if (!form.name.trim()) {
+      setError("Name is required");
+      return;
+    }
+    if (providers.some((p) => p.name === form.name.trim())) {
+      setError("Provider name already exists");
+      return;
+    }
+    if (!form.base_url.trim()) {
+      setError("Base URL is required");
+      return;
+    }
+    addProvider({
+      name: form.name.trim(),
+      base_url: form.base_url.trim(),
+      api_key: form.api_key,
+      priority: form.priority,
+      weight: form.weight,
+      enabled: true,
+      models: form.models.split(",").map((m) => m.trim()).filter(Boolean),
+      status: "healthy",
+      cooldown_until: null,
+      consecutive_failures: 0,
+      stats: {
+        total_requests: 0,
+        total_errors: 0,
+        error_rate: 0,
+        avg_latency_ms: 0,
+        latency_history: [],
+      },
+    });
+    toast.success(`Provider "${form.name.trim()}" added`);
+    onClose();
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm" onClick={onClose}>
+      <div className="bg-card border rounded-lg shadow-lg w-full max-w-md p-6 space-y-4" onClick={(e) => e.stopPropagation()}>
+        <div className="flex items-center justify-between">
+          <h3 className="text-lg font-semibold">Add Provider</h3>
+          <button onClick={onClose} className="text-muted-foreground hover:text-foreground">
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+        {error && (
+          <div className="text-sm text-destructive bg-destructive/10 p-2 rounded">
+            {error}
+          </div>
+        )}
+        <div className="space-y-3">
+          <div className="space-y-1">
+            <label className="text-sm font-medium">Name *</label>
+            <Input
+              value={form.name}
+              onChange={(e) => { setForm({ ...form, name: e.target.value }); setError(""); }}
+              placeholder="my-provider"
+            />
+          </div>
+          <div className="space-y-1">
+            <label className="text-sm font-medium">Base URL *</label>
+            <Input
+              value={form.base_url}
+              onChange={(e) => setForm({ ...form, base_url: e.target.value })}
+              placeholder="https://api.example.com/v1"
+            />
+          </div>
+          <div className="space-y-1">
+            <label className="text-sm font-medium">API Key</label>
+            <Input
+              value={form.api_key}
+              onChange={(e) => setForm({ ...form, api_key: e.target.value })}
+              type="password"
+              placeholder="sk-..."
+            />
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <div className="space-y-1">
+              <label className="text-sm font-medium">Priority</label>
+              <Input
+                type="number"
+                value={form.priority}
+                onChange={(e) => setForm({ ...form, priority: Number(e.target.value) })}
+                min={1}
+              />
+            </div>
+            <div className="space-y-1">
+              <label className="text-sm font-medium">Weight</label>
+              <Input
+                type="number"
+                value={form.weight}
+                onChange={(e) => setForm({ ...form, weight: Number(e.target.value) })}
+                min={0}
+              />
+            </div>
+          </div>
+          <div className="space-y-1">
+            <label className="text-sm font-medium">Models (comma separated)</label>
+            <Input
+              value={form.models}
+              onChange={(e) => setForm({ ...form, models: e.target.value })}
+              placeholder="gpt-4, gpt-3.5-turbo"
+            />
+          </div>
+        </div>
+        <div className="flex justify-end gap-2 pt-2">
+          <Button variant="outline" size="sm" onClick={onClose}>Cancel</Button>
+          <Button size="sm" onClick={handleSave} className="gap-1.5">
+            <Plus className="h-3.5 w-3.5" /> Add
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/**
  * Edit modal for a provider.
  */
 function EditProviderModal({
@@ -79,6 +236,7 @@ function EditProviderModal({
   const [form, setForm] = useState({
     base_url: provider.base_url,
     api_key: provider.api_key,
+    priority: provider.priority,
     weight: provider.weight,
     models: provider.models.join(", "),
   });
@@ -87,6 +245,7 @@ function EditProviderModal({
     updateProvider(provider.name, {
       base_url: form.base_url,
       api_key: form.api_key,
+      priority: form.priority,
       weight: form.weight,
       models: form.models.split(",").map((m) => m.trim()).filter(Boolean),
     });
@@ -111,6 +270,10 @@ function EditProviderModal({
           <div className="space-y-1">
             <label className="text-sm font-medium">API Key</label>
             <Input value={form.api_key} onChange={(e) => setForm({ ...form, api_key: e.target.value })} type="password" />
+          </div>
+          <div className="space-y-1">
+            <label className="text-sm font-medium">Priority</label>
+            <Input type="number" value={form.priority} onChange={(e) => setForm({ ...form, priority: Number(e.target.value) })} min={1} />
           </div>
           <div className="space-y-1">
             <label className="text-sm font-medium">Weight</label>
@@ -347,10 +510,7 @@ function ProviderCard({
           {provider.status === "cooldown" && provider.cooldown_until && (
             <div className="flex items-center gap-2 p-2 rounded-md bg-amber-500/10 text-amber-600 dark:text-amber-400 text-xs animate-pulse">
               <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
-              <span>
-                Quota exceeded. Recovers at{" "}
-                {new Date(provider.cooldown_until).toLocaleTimeString()}
-              </span>
+              <CooldownCountdown until={provider.cooldown_until} />
             </div>
           )}
 
@@ -409,6 +569,7 @@ function ProviderCard({
 export default function Providers() {
   const providers = useAppStore((s) => s.providers);
   const reorderProviders = useAppStore((s) => s.reorderProviders);
+  const [addModalOpen, setAddModalOpen] = useState(false);
 
   const sorted = [...providers].sort((a, b) => a.priority - b.priority);
 
@@ -434,7 +595,7 @@ export default function Providers() {
     <div className="space-y-6">
       <div className="flex items-center justify-between">
         <h1 className="text-2xl font-bold tracking-tight">Providers</h1>
-        <Button className="gap-2">
+        <Button className="gap-2" onClick={() => setAddModalOpen(true)}>
           <Plus className="h-4 w-4" /> Add Provider
         </Button>
       </div>
@@ -452,6 +613,8 @@ export default function Providers() {
           </div>
         </SortableContext>
       </DndContext>
+
+      {addModalOpen && <AddProviderModal onClose={() => setAddModalOpen(false)} />}
     </div>
   );
 }

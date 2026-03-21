@@ -45,6 +45,7 @@ interface AppState {
   updateProviderPriority: (name: string, priority: number) => void;
   updateProviderWeight: (name: string, weight: number) => void;
   setRoutingConfig: (config: Partial<RoutingConfig>) => void;
+  setPinnedProvider: (name: string) => void;
   addModelRule: (rule: ModelRule) => void;
   removeModelRule: (id: string) => void;
   toggleDarkMode: () => void;
@@ -54,6 +55,8 @@ interface AppState {
   updateProviderStatus: (name: string, status: ProviderStatus, cooldownUntil: string | null) => void;
   updateProviderStats: (name: string, delta: { addRequest?: boolean; addError?: boolean; latency?: number }) => void;
   updateProvider: (name: string, updates: Partial<Provider>) => void;
+  addProvider: (provider: Provider) => void;
+  removeProvider: (name: string) => void;
 }
 
 export const useAppStore = create<AppState>((set) => ({
@@ -101,6 +104,11 @@ export const useAppStore = create<AppState>((set) => ({
   setRoutingConfig: (config) =>
     set((state) => ({
       routingConfig: { ...state.routingConfig, ...config },
+    })),
+
+  setPinnedProvider: (name) =>
+    set((state) => ({
+      routingConfig: { ...state.routingConfig, pinned_provider: name },
     })),
 
   addModelRule: (rule) =>
@@ -194,5 +202,29 @@ export const useAppStore = create<AppState>((set) => ({
       providers: state.providers.map((p) =>
         p.name === name ? { ...p, ...updates } : p
       ),
+    })),
+
+  addProvider: (provider) =>
+    set((state) => ({
+      providers: [...state.providers, provider],
+      systemStats: {
+        ...state.systemStats,
+        total_providers: state.systemStats.total_providers + 1,
+        active_providers: provider.enabled
+          ? state.systemStats.active_providers + 1
+          : state.systemStats.active_providers,
+      },
+    })),
+
+  removeProvider: (name) =>
+    set((state) => ({
+      providers: state.providers.filter((p) => p.name !== name),
+      systemStats: {
+        ...state.systemStats,
+        total_providers: state.systemStats.total_providers - 1,
+        active_providers: state.providers.find((p) => p.name === name)?.enabled
+          ? state.systemStats.active_providers - 1
+          : state.systemStats.active_providers,
+      },
     })),
 }));

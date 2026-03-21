@@ -6,6 +6,8 @@ import {
   CheckCircle2,
   AlertCircle,
   FileText,
+  Eye,
+  EyeOff,
 } from "lucide-react";
 import { toast } from "sonner";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -22,8 +24,23 @@ export default function Config() {
   const [localConfig, setLocalConfig] = useState(configToml);
   const [isValid, setIsValid] = useState(true);
   const [savedMsg, setSavedMsg] = useState(false);
+  const [showKeys, setShowKeys] = useState(false);
+  const [lastModified, setLastModified] = useState(new Date());
+  const [lastReloaded, setLastReloaded] = useState<Date | null>(null);
 
   const isDirty = localConfig !== configToml;
+
+  /**
+   * Mask API keys in TOML content.
+   */
+  function maskApiKeys(text: string): string {
+    return text.replace(
+      /api_key\s*=\s*"([^"]+)"/g,
+      (_, key) => `api_key = "${key.slice(0, 5)}****${key.slice(-4)}"`
+    );
+  }
+
+  const displayConfig = showKeys ? localConfig : maskApiKeys(localConfig);
 
   /**
    * Simple TOML validation heuristic (mock).
@@ -42,6 +59,7 @@ export default function Config() {
     setLocalConfig(value);
     setIsValid(validateConfig(value));
     setSavedMsg(false);
+    setLastModified(new Date());
   }
 
   /**
@@ -50,6 +68,7 @@ export default function Config() {
   function handleSave() {
     if (!isValid) return;
     setSavedMsg(true);
+    setLastReloaded(new Date());
     toast.success("Config saved & reloaded");
     setTimeout(() => setSavedMsg(false), 3000);
   }
@@ -111,12 +130,21 @@ export default function Config() {
                   Saved & Reloaded
                 </Badge>
               )}
+              <Button
+                variant="ghost"
+                size="icon"
+                className="h-7 w-7"
+                onClick={() => setShowKeys(!showKeys)}
+                title={showKeys ? "Hide API keys" : "Show API keys"}
+              >
+                {showKeys ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+              </Button>
             </div>
           </div>
         </CardHeader>
         <CardContent className="space-y-4">
           <Textarea
-            value={localConfig}
+            value={displayConfig}
             onChange={(e) => handleChange(e.target.value)}
             className="min-h-[500px] font-mono text-sm leading-relaxed resize-y"
             spellCheck={false}
@@ -160,7 +188,12 @@ export default function Config() {
         <CardContent className="pt-6">
           <div className="flex items-center justify-between text-sm text-muted-foreground">
             <span>Config File Path: ~/.config/zz/config.toml</span>
-            <span>Last reloaded: {new Date().toLocaleString()}</span>
+            <div className="space-x-4">
+              <span>Last modified: {lastModified.toLocaleString()}</span>
+              {lastReloaded && (
+                <span>Last reloaded: {lastReloaded.toLocaleString()}</span>
+              )}
+            </div>
           </div>
         </CardContent>
       </Card>

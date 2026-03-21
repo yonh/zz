@@ -23,9 +23,11 @@ import {
 } from "recharts";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
+import { Select } from "@/components/ui/select";
 import { useAppStore } from "@/stores/store";
 import { generateRequestRateData } from "@/api/mock";
 import { cn } from "@/lib/utils";
+import { toast } from "sonner";
 
 const CHART_COLORS = [
   "hsl(12, 76%, 61%)",
@@ -42,9 +44,23 @@ export default function Overview() {
   const systemStats = useAppStore((s) => s.systemStats);
   const logs = useAppStore((s) => s.logs);
   const providers = useAppStore((s) => s.providers);
+  const setStrategy = useAppStore((s) => s.setStrategy);
   const requestRateData = useMemo(() => generateRequestRateData(), []);
 
   const recentLogs = logs.slice(0, 20);
+
+  const strategyOptions = [
+    { value: "failover", label: "Failover" },
+    { value: "round-robin", label: "Round Robin" },
+    { value: "weighted-random", label: "Weighted Random" },
+    { value: "quota-aware", label: "Quota-Aware" },
+    { value: "manual", label: "Manual / Fixed" },
+  ];
+
+  function handleStrategyChange(value: string) {
+    setStrategy(value as typeof systemStats.strategy);
+    toast.success(`Strategy changed to ${value}`);
+  }
 
   // Track newly arriving log IDs to animate them
   const [newLogIds, setNewLogIds] = useState<Set<string>>(new Set());
@@ -132,10 +148,13 @@ export default function Overview() {
             <ArrowRightLeft className="h-4 w-4 text-muted-foreground" />
           </CardHeader>
           <CardContent>
-            <div className="text-2xl font-bold capitalize">
-              {systemStats.strategy.replace("-", " ")}
-            </div>
-            <p className="text-xs text-muted-foreground">
+            <Select
+              value={systemStats.strategy}
+              onChange={(e) => handleStrategyChange(e.target.value)}
+              options={strategyOptions}
+              className="h-8 text-sm"
+            />
+            <p className="text-xs text-muted-foreground mt-1">
               Uptime: {Math.floor(systemStats.uptime_secs / 3600)}h{" "}
               {Math.floor((systemStats.uptime_secs % 3600) / 60)}m
             </p>
