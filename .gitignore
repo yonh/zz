@@ -1,8 +1,60 @@
-/target
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
 
-# UI
+# Cargo
+# Note: Cargo.lock should be committed for binaries, ignored for libraries
+
+# Config (contains sensitive API keys)
+config.toml
+!.config.toml.example
+
+# Logs
+*.log
+logs/
+
+# IDE / Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+ehthumbs.db
+
+# UI (Node.js / TypeScript)
 ui/node_modules/
 ui/dist/
+ui/.vite/
+ui/.turbo/
 ui/.playwright-cli/
+ui/.env
+ui/.env.local
+ui/.env.*.local
+
+# Binary files
 *.png
+*.jpg
+*.jpeg
+*.gif
 *.pdf
+*.zip
+*.tar.gz
+
+# Test coverage
+coverage/
+.nyc_output/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.temp
