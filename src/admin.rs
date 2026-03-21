@@ -51,13 +51,22 @@ fn handle_health(state: Option<&super::proxy::AppState>) -> hyper::Response<Resp
     resp
 }
 
-fn handle_stats(_state: Option<&super::proxy::AppState>) -> hyper::Response<ResponseBody> {
-    // TODO: Implement actual stats tracking
-    let body = serde_json::to_string(&serde_json::json!({
-        "requests": 0,
-        "errors": 0,
-        "providers": []
-    })).unwrap();
+fn handle_stats(state: Option<&super::proxy::AppState>) -> hyper::Response<ResponseBody> {
+    let body = if let Some(s) = state {
+        let (total_requests, total_errors) = s.provider_manager.get_total_stats();
+        let providers = s.provider_manager.get_all_stats();
+        serde_json::to_string(&serde_json::json!({
+            "total_requests": total_requests,
+            "total_errors": total_errors,
+            "providers": providers
+        })).unwrap_or_else(|_| "{\"status\":\"error\"}".to_string())
+    } else {
+        serde_json::to_string(&serde_json::json!({
+            "total_requests": 0,
+            "total_errors": 0,
+            "providers": []
+        })).unwrap()
+    };
 
     let mut resp = hyper::Response::new(full(body));
     resp.headers_mut().insert(

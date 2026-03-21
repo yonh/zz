@@ -1,9 +1,13 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use dashmap::DashMap;
 
 pub struct Provider {
     pub config: crate::config::ProviderConfig,
     pub state: std::sync::Mutex<ProviderState>,
+    pub request_count: AtomicU64,
+    pub error_count: AtomicU64,
+    pub failure_count: std::sync::Mutex<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -18,27 +22,46 @@ impl Provider {
         Self {
             config,
             state: std::sync::Mutex::new(ProviderState::Healthy),
+            request_count: AtomicU64::new(0),
+            error_count: AtomicU64::new(0),
+            failure_count: std::sync::Mutex::new(0),
         }
+    }
+
+    pub fn increment_request(&self) {
+        self.request_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn increment_error(&self) {
+        self.error_count.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn mark_quota_exhausted(&self, cooldown_secs: u64) {
         let mut state = self.state.lock().unwrap();
         let until = chrono::Utc::now() + chrono::Duration::seconds(cooldown_secs as i64);
         *state = ProviderState::Cooldown { until };
+        // Reset failure count on quota exhaustion
+        *self.failure_count.lock().unwrap() = 0;
     }
 
-    pub fn mark_failure(&self) -> bool {
-        // For simplicity, just mark as unhealthy after threshold
-        // In production, track failure count and threshold
-        let mut state = self.state.lock().unwrap();
-        let recovery_at = chrono::Utc::now() + chrono::Duration::seconds(600);
-        *state = ProviderState::Unhealthy { recovery_at };
-        false // return true if reached threshold
+    pub fn mark_failure(&self, failure_threshold: usize, recovery_secs: u64) -> bool {
+        let mut failure_count = self.failure_count.lock().unwrap();
+        *failure_count += 1;
+
+        if *failure_count >= failure_threshold {
+            let mut state = self.state.lock().unwrap();
+            let recovery_at = chrono::Utc::now() + chrono::Duration::seconds(recovery_secs as i64);
+            *state = ProviderState::Unhealthy { recovery_at };
+            *failure_count = 0;
+            return true;
+        }
+        false
     }
 
     pub fn reset(&self) {
         let mut state = self.state.lock().unwrap();
         *state = ProviderState::Healthy;
+        *self.failure_count.lock().unwrap() = 0;
     }
 
     pub fn is_available(&self) -> bool {
@@ -49,6 +72,43 @@ impl Provider {
             ProviderState::Unhealthy { recovery_at } => chrono::Utc::now() > *recovery_at,
         }
     }
+
+    pub fn get_stats(&self) -> ProviderStats {
+        let state = self.state.lock().unwrap();
+        let state_str = match &*state {
+            ProviderState::Healthy => "healthy",
+            ProviderState::Cooldown { until } => {
+                if chrono::Utc::now() < *until {
+                    "cooldown"
+                } else {
+                    "healthy"
+                }
+            }
+            ProviderState::Unhealthy { recovery_at } => {
+                if chrono::Utc::now() < *recovery_at {
+                    "unhealthy"
+                } else {
+                    "healthy"
+                }
+            }
+        };
+        ProviderStats {
+            name: self.config.name.clone(),
+            state: state_str.to_string(),
+            request_count: self.request_count.load(Ordering::Relaxed),
+            error_count: self.error_count.load(Ordering::Relaxed),
+            failure_count: *self.failure_count.lock().unwrap(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ProviderStats {
+    pub name: String,
+    pub state: String,
+    pub request_count: u64,
+    pub error_count: u64,
+    pub failure_count: usize,
 }
 
 pub struct ProviderManager {
@@ -85,12 +145,18 @@ impl ProviderManager {
         if let Some(provider) = self.providers.get(name) {
             let cooldown_secs = self.health_config.read().unwrap().cooldown_secs;
             provider.mark_quota_exhausted(cooldown_secs);
+            provider.increment_error();
         }
     }
 
     pub fn mark_failure(&self, name: &str) {
         if let Some(provider) = self.providers.get(name) {
-            provider.mark_failure();
+            let (failure_threshold, recovery_secs) = {
+                let config = self.health_config.read().unwrap();
+                (config.failure_threshold, config.recovery_secs)
+            };
+            provider.mark_failure(failure_threshold, recovery_secs);
+            provider.increment_error();
         }
     }
 
@@ -100,36 +166,43 @@ impl ProviderManager {
         }
     }
 
+    pub fn increment_request(&self, name: &str) {
+        if let Some(provider) = self.providers.get(name) {
+            provider.increment_request();
+        }
+    }
+
     pub fn get_all_states(&self) -> Vec<ProviderStatus> {
         self.providers
             .iter()
             .map(|entry| {
-                let state = entry.value().state.lock().unwrap();
-                let state_str = match &*state {
-                    ProviderState::Healthy => "healthy",
-                    ProviderState::Cooldown { until } => {
-                        if chrono::Utc::now() < *until {
-                            "cooldown"
-                        } else {
-                            "healthy"
-                        }
-                    }
-                    ProviderState::Unhealthy { recovery_at } => {
-                        if chrono::Utc::now() < *recovery_at {
-                            "unhealthy"
-                        } else {
-                            "healthy"
-                        }
-                    }
-                };
+                let stats = entry.value().get_stats();
                 ProviderStatus {
-                    name: entry.key().clone(),
-                    state: state_str.to_string(),
+                    name: stats.name,
+                    state: stats.state,
                 }
             })
             .collect()
     }
-pub fn reload(&self, config: &crate::config::Config) {
+
+    pub fn get_all_stats(&self) -> Vec<ProviderStats> {
+        self.providers
+            .iter()
+            .map(|entry| entry.value().get_stats())
+            .collect()
+    }
+
+    pub fn get_total_stats(&self) -> (u64, u64) {
+        let mut total_requests = 0u64;
+        let mut total_errors = 0u64;
+        for entry in self.providers.iter() {
+            total_requests += entry.value().request_count.load(Ordering::Relaxed);
+            total_errors += entry.value().error_count.load(Ordering::Relaxed);
+        }
+        (total_requests, total_errors)
+    }
+
+    pub fn reload(&self, config: &crate::config::Config) {
         // Update health config
         *self.health_config.write().unwrap() = config.health.clone();
 

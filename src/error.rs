@@ -21,13 +21,19 @@ pub enum ProxyError {
     HttpError(String),
 }
 
+/// Check if response indicates quota exhaustion
+/// - HTTP 429 (Too Many Requests)
+/// - HTTP 403 with quota-related body keywords
 pub fn is_quota_error(status: hyper::StatusCode, body: &[u8]) -> bool {
     if status == hyper::StatusCode::TOO_MANY_REQUESTS {
         return true;
     }
 
     if status == hyper::StatusCode::FORBIDDEN {
-        let body_str = std::str::from_utf8(body).unwrap_or("");
+        // Only check first 1KB of body as per spec
+        let check_len = body.len().min(1024);
+        let body_slice = &body[..check_len];
+        let body_str = std::str::from_utf8(body_slice).unwrap_or("");
         let body_lower = body_str.to_lowercase();
         let keywords = [
             "quota", "rate limit", "exceeded", "insufficient_quota",
@@ -37,9 +43,4 @@ pub fn is_quota_error(status: hyper::StatusCode, body: &[u8]) -> bool {
     }
 
     false
-}
-
-pub fn is_failover_eligible(status: hyper::StatusCode) -> bool {
-    status.as_u16() == 429 // Too Many Requests
-        || (status.as_u16() >= 500 && status.as_u16() < 600) // 5xx errors
 }

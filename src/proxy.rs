@@ -68,6 +68,9 @@ pub async fn proxy_handler(
             "Selected provider for request"
         );
 
+        // Increment request counter
+        state.provider_manager.increment_request(&provider_name);
+
         // Attempt request with this provider
         match attempt_request(
             &provider_name,
@@ -104,15 +107,7 @@ pub async fn proxy_handler(
 }
 
 fn is_sse_request(req: &hyper::Request<Incoming>) -> bool {
-    // Check Accept header
-    if let Some(accept) = req.headers().get(hyper::header::ACCEPT) {
-        if let Ok(accept_str) = accept.to_str() {
-            if accept_str.contains("text/event-stream") {
-                return true;
-            }
-        }
-    }
-    false
+    crate::stream::is_sse_request(req)
 }
 
 async fn attempt_request(
@@ -171,12 +166,15 @@ async fn attempt_request(
     // Send request to upstream with timeout
     tracing::debug!(url = %upstream_url, is_sse = is_sse, "Sending request to upstream");
 
+    let start = std::time::Instant::now();
     let response = tokio::time::timeout(
         timeout,
         client.request(upstream_req)
     ).await
         .map_err(|_| crate::error::ProxyError::RequestError("Request timeout".to_string()))?
         .map_err(|e| crate::error::ProxyError::HttpError(e.to_string()))?;
+
+    let elapsed = start.elapsed();
 
     let status = response.status();
     let response_headers = response.headers().clone();
@@ -222,6 +220,14 @@ async fn attempt_request(
 
     // Success response
     state.provider_manager.reset(provider_name);
+
+    tracing::info!(
+        provider = %provider_name,
+        status = %status.as_u16(),
+        elapsed_ms = elapsed.as_millis(),
+        is_sse = is_sse,
+        "Request completed"
+    );
 
     if is_sse {
         // Stream response for SSE
