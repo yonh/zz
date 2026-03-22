@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 use dashmap::DashMap;
 
 pub struct Provider {
-    pub config: crate::config::ProviderConfig,
+    pub config: std::sync::RwLock<crate::config::ProviderConfig>,
     pub state: std::sync::Mutex<ProviderState>,
     pub request_count: AtomicU64,
     pub error_count: AtomicU64,
@@ -12,6 +12,9 @@ pub struct Provider {
     pub enabled: AtomicBool,
     pub latency_history: std::sync::Mutex<VecDeque<u64>>,
     pub latency_ema: std::sync::Mutex<f64>,
+    // Token tracking
+    pub total_prompt_tokens: AtomicU64,
+    pub total_completion_tokens: AtomicU64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -24,7 +27,7 @@ pub enum ProviderState {
 impl Provider {
     pub fn new(config: crate::config::ProviderConfig) -> Self {
         Self {
-            config,
+            config: std::sync::RwLock::new(config),
             state: std::sync::Mutex::new(ProviderState::Healthy),
             request_count: AtomicU64::new(0),
             error_count: AtomicU64::new(0),
@@ -32,6 +35,8 @@ impl Provider {
             enabled: AtomicBool::new(true),
             latency_history: std::sync::Mutex::new(VecDeque::with_capacity(12)),
             latency_ema: std::sync::Mutex::new(0.0),
+            total_prompt_tokens: AtomicU64::new(0),
+            total_completion_tokens: AtomicU64::new(0),
         }
     }
 
@@ -41,6 +46,12 @@ impl Provider {
 
     pub fn increment_error(&self) {
         self.error_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record token usage from API response
+    pub fn record_tokens(&self, prompt: u64, completion: u64) {
+        self.total_prompt_tokens.fetch_add(prompt, Ordering::Relaxed);
+        self.total_completion_tokens.fetch_add(completion, Ordering::Relaxed);
     }
 
     pub fn mark_quota_exhausted(&self, cooldown_secs: u64) {
@@ -149,8 +160,9 @@ impl Provider {
                 }
             }
         };
+        let config = self.config.read().unwrap();
         ProviderStats {
-            name: self.config.name.clone(),
+            name: config.name.clone(),
             state: state_str.to_string(),
             enabled: self.is_enabled(),
             request_count: self.request_count.load(Ordering::Relaxed),
@@ -159,13 +171,16 @@ impl Provider {
             avg_latency_ms: self.get_avg_latency(),
             latency_ema: self.get_latency_ema(),
             latency_history: self.get_latency_history(),
+            prompt_tokens: self.total_prompt_tokens.load(Ordering::Relaxed),
+            completion_tokens: self.total_completion_tokens.load(Ordering::Relaxed),
         }
     }
 
     /// Check if this provider supports the given model.
     /// Uses glob patterns from config (e.g., "gpt-4*" matches "gpt-4-turbo").
     pub fn supports_model(&self, model: &str) -> bool {
-        crate::router::provider_supports_model(&self.config.models, model)
+        let config = self.config.read().unwrap();
+        crate::router::provider_supports_model(&config.models, model)
     }
 }
 
@@ -180,6 +195,8 @@ pub struct ProviderStats {
     pub avg_latency_ms: u64,
     pub latency_ema: f64,
     pub latency_history: Vec<u64>,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
 }
 
 pub struct ProviderManager {
@@ -256,6 +273,24 @@ impl ProviderManager {
         }
     }
 
+    /// Record token usage for a provider
+    pub fn record_tokens(&self, name: &str, prompt: u64, completion: u64) {
+        if let Some(provider) = self.providers.get(name) {
+            provider.record_tokens(prompt, completion);
+        }
+    }
+
+    /// Get total token usage across all providers
+    pub fn get_total_tokens(&self) -> (u64, u64) {
+        let mut total_prompt = 0u64;
+        let mut total_completion = 0u64;
+        for entry in self.providers.iter() {
+            total_prompt += entry.value().total_prompt_tokens.load(Ordering::Relaxed);
+            total_completion += entry.value().total_completion_tokens.load(Ordering::Relaxed);
+        }
+        (total_prompt, total_completion)
+    }
+
     pub fn get_all_states(&self) -> Vec<ProviderStatus> {
         self.providers
             .iter()
@@ -308,11 +343,17 @@ impl ProviderManager {
 
         // Add or update providers
         for provider_config in &config.provider_configs {
-            if self.providers.contains_key(&provider_config.name) {
-                // Update existing provider's config - need to replace the whole provider
-                let provider = Arc::new(Provider::new(provider_config.clone()));
-                self.providers.insert(provider_config.name.clone(), provider);
-                tracing::info!(provider = %provider_config.name, "Updated provider config");
+            if let Some(entry) = self.providers.get(&provider_config.name) {
+                // Update existing provider's config in-place (preserves runtime state)
+                let mut cfg = entry.config.write().unwrap();
+                cfg.base_url = provider_config.base_url.clone();
+                cfg.api_key = provider_config.api_key.clone();
+                cfg.priority = provider_config.priority;
+                cfg.weight = provider_config.weight;
+                cfg.models = provider_config.models.clone();
+                cfg.headers = provider_config.headers.clone();
+                cfg.token_budget = provider_config.token_budget;
+                tracing::info!(provider = %provider_config.name, "Updated provider config in-place");
             } else {
                 // Add new provider
                 let provider = Arc::new(Provider::new(provider_config.clone()));
@@ -352,26 +393,17 @@ impl ProviderManager {
         let provider = self.providers.get(name)
             .ok_or_else(|| format!("Provider not found: {}", name))?;
 
-        // We need to create a new Provider with updated config but preserve stats
-        // Since config fields are in the Provider struct, we need careful update
-        let mut new_config = provider.config.clone();
-        if let Some(base_url) = updates.base_url { new_config.base_url = base_url; }
-        if let Some(api_key) = updates.api_key { new_config.api_key = api_key; }
-        if let Some(priority) = updates.priority { new_config.priority = priority; }
-        if let Some(weight) = updates.weight { new_config.weight = weight; }
-        if let Some(models) = updates.models { new_config.models = models; }
-        if let Some(headers) = updates.headers { new_config.headers = headers; }
-        if let Some(token_budget) = updates.token_budget { new_config.token_budget = token_budget; }
+        // Update config in-place (preserves runtime state)
+        let mut config = provider.config.write().unwrap();
+        if let Some(base_url) = updates.base_url { config.base_url = base_url; }
+        if let Some(api_key) = updates.api_key { config.api_key = api_key; }
+        if let Some(priority) = updates.priority { config.priority = priority; }
+        if let Some(weight) = updates.weight { config.weight = weight; }
+        if let Some(models) = updates.models { config.models = models; }
+        if let Some(headers) = updates.headers { config.headers = headers; }
+        if let Some(token_budget) = updates.token_budget { config.token_budget = token_budget; }
 
-        drop(provider); // Release DashMap read lock
-
-        // Replace with new provider (preserving name, resetting stats)
-        // Note: This resets runtime stats. For a non-destructive update,
-        // Provider.config would need interior mutability (Mutex/RwLock).
-        let new_provider = Arc::new(Provider::new(new_config));
-        self.providers.insert(name.to_string(), new_provider);
-
-        tracing::info!(provider = %name, "Updated provider config at runtime");
+        tracing::info!(provider = %name, "Updated provider config in-place at runtime");
         Ok(())
     }
 }

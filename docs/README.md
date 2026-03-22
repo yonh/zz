@@ -14,6 +14,7 @@
 延期事项、未来方向和历史计划。
 
 - `codex-responses/` - Codex Responses 任务的后续规划
+- `code-remediation/` - 已完成整改任务拆出的后续事项
 - `historical-plans/` - 旧规划批次与历史记录
 
 ### [reference/](./reference/)
@@ -29,6 +30,7 @@
 已完成任务的归档文档，主要用于避免未来重复设计或重复实现。
 
 - `backend-fix/` - 已完成的后端修复
+- `code-remediation/` - 已完成的代码整改批次
 
 ### [process/](./process/)
 跨任务流程文档，说明任务如何流转、如何使用 Windsurf workflow、如何做审核与归档。

@@ -57,7 +57,7 @@ impl Router {
             RoutingStrategy::Failover => {
                 // Sort by priority, then pick first
                 let mut sorted = providers.to_vec();
-                sorted.sort_by_key(|(_, p)| p.config.priority);
+                sorted.sort_by_key(|(_, p)| p.config.read().unwrap().priority);
                 sorted.first().cloned()
             }
             RoutingStrategy::RoundRobin => {
@@ -73,7 +73,7 @@ impl Router {
                 // Select provider with lowest token usage (if available)
                 // For now, fall back to failover behavior
                 let mut sorted = providers.to_vec();
-                sorted.sort_by_key(|(_, p)| p.config.priority);
+                sorted.sort_by_key(|(_, p)| p.config.read().unwrap().priority);
                 sorted.first().cloned()
             }
             RoutingStrategy::Manual => {

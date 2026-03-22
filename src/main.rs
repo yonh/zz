@@ -85,6 +85,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ws_broadcaster: ws_broadcaster.clone(),
         model_rules,
         rpm_counter,
+        last_reloaded: Arc::new(std::sync::Mutex::new(None)),
     };
 
     // Create server

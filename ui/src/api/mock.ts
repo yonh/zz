@@ -15,7 +15,7 @@ export const mockProviders: Provider[] = [
   {
     name: "ali-account-1",
     base_url: "https://dashscope.aliyuncs.com/compatible-mode",
-    api_key: "sk-abcd1234xxxxxxxxxxxx",
+    api_key_masked: "sk-a****1234****xxxx",
     priority: 1,
     weight: 50,
     enabled: true,
@@ -29,12 +29,15 @@ export const mockProviders: Provider[] = [
       error_rate: 0.22,
       avg_latency_ms: 1200,
       latency_history: [980, 1100, 1050, 1300, 1200, 1150, 900, 1400, 1100, 1000, 1250, 1300],
+      prompt_tokens: 1250000,
+      completion_tokens: 890000,
+      total_tokens: 2140000,
     },
   },
   {
     name: "zhipu-account-1",
     base_url: "https://open.bigmodel.cn/api/paas/v4",
-    api_key: "sk-efgh5678xxxxxxxxxxxx",
+    api_key_masked: "sk-e****5678****xxxx",
     priority: 2,
     weight: 30,
     enabled: true,
@@ -48,12 +51,15 @@ export const mockProviders: Provider[] = [
       error_rate: 0.16,
       avg_latency_ms: 800,
       latency_history: [750, 820, 780, 900, 850, 700, 810, 770, 830, 800, 750, 790],
+      prompt_tokens: 780000,
+      completion_tokens: 520000,
+      total_tokens: 1300000,
     },
   },
   {
     name: "ali-account-2",
     base_url: "https://dashscope.aliyuncs.com/compatible-mode",
-    api_key: "sk-ijkl9012xxxxxxxxxxxx",
+    api_key_masked: "sk-i****9012****xxxx",
     priority: 3,
     weight: 20,
     enabled: true,
@@ -67,12 +73,15 @@ export const mockProviders: Provider[] = [
       error_rate: 2.14,
       avg_latency_ms: 1500,
       latency_history: [1200, 1300, 1400, 1600, 1800, 2000, 1500, 1700, 1900, 1400, 1600, 1500],
+      prompt_tokens: 450000,
+      completion_tokens: 320000,
+      total_tokens: 770000,
     },
   },
   {
     name: "deepseek-1",
     base_url: "https://api.deepseek.com",
-    api_key: "sk-mnop3456xxxxxxxxxxxx",
+    api_key_masked: "sk-m****3456****xxxx",
     priority: 4,
     weight: 0,
     enabled: false,
@@ -86,6 +95,9 @@ export const mockProviders: Provider[] = [
       error_rate: 0,
       avg_latency_ms: 0,
       latency_history: [],
+      prompt_tokens: 0,
+      completion_tokens: 0,
+      total_tokens: 0,
     },
   },
 ];
@@ -101,6 +113,11 @@ export const mockSystemStats: SystemStats = {
   total_providers: 4,
   strategy: "failover",
   uptime_secs: 86400,
+  tokens: {
+    prompt: 2480000,
+    completion: 1730000,
+    total: 4210000,
+  },
 };
 
 /**
@@ -164,6 +181,11 @@ export function generateMockLogs(count: number = 50): LogEntry[] {
       failover_chain: isFailover
         ? [`${providers[0]}:429`, `${providers[1]}:200`]
         : null,
+      token_usage: isError ? undefined : {
+        prompt_tokens: Math.floor(100 + Math.random() * 2000),
+        completion_tokens: Math.floor(50 + Math.random() * 1000),
+        total_tokens: Math.floor(150 + Math.random() * 3000),
+      },
     });
   }
   return logs;

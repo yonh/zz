@@ -161,6 +161,15 @@ pub async fn proxy_handler(
                 let latency_ms = proxy_start.elapsed().as_millis() as u64;
                 provider.record_latency(latency_ms);
 
+                // Record token usage if available
+                if let Some(ref usage) = token_usage {
+                    state.provider_manager.record_tokens(
+                        &provider_name,
+                        usage.prompt_tokens,
+                        usage.completion_tokens,
+                    );
+                }
+
                 // Build and store log entry
                 let log_entry = crate::stats::LogEntry {
                     id: request_id.clone(),
@@ -248,18 +257,24 @@ async fn attempt_request(
     request_timeout_secs: u64,
 ) -> Result<(hyper::Response<ResponseBody>, u64, u64, Option<crate::stats::TokenUsage>), crate::error::ProxyError> {
     // Returns: (response, response_bytes, ttfb_ms, token_usage)
+    // Extract config values (needed to avoid holding RwLock across await)
+    let (base_url, api_key, extra_headers) = {
+        let config = provider.config.read().unwrap();
+        (config.base_url.clone(), config.api_key.clone(), config.headers.clone())
+    };
+
     // Rewrite URL
     let upstream_url = crate::rewriter::RequestRewriter::rewrite_url(
-        &provider.config.base_url,
+        &base_url,
         path,
     ).map_err(|e| crate::error::ProxyError::RequestError(e.to_string()))?;
 
     // Rewrite headers
     let rewritten_headers = crate::rewriter::RequestRewriter::rewrite_headers(
         headers,
-        &provider.config.api_key,
-        &provider.config.base_url,
-        &provider.config.headers,
+        &api_key,
+        &base_url,
+        &extra_headers,
     );
 
     // Build upstream request
@@ -374,7 +389,9 @@ async fn attempt_request(
             downstream_response = downstream_response.header(name, value);
         }
 
-        // response_bytes unknown for streaming, token usage typically in last SSE event
+        // SSE streaming response is passed through directly without token usage extraction.
+        // Token usage from streaming responses (last SSE chunk) is not currently collected.
+        // This is a known limitation. See FIX-06 in docs/active-work/code-remediation/spec.md.
         Ok((downstream_response
             .body(body)
             .unwrap(), 0, ttfb_ms, None))
@@ -411,6 +428,7 @@ pub struct AppState {
     pub ws_broadcaster: Arc<crate::ws::WsBroadcaster>,
     pub model_rules: Arc<std::sync::RwLock<Vec<crate::router::ModelRule>>>,
     pub rpm_counter: Arc<crate::stats::RpmCounter>,
+    pub last_reloaded: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl AppState {
@@ -438,6 +456,10 @@ impl AppState {
             let mut config = self.config.write().unwrap();
             *config = new_config;
         }
+
+        // Update last_reloaded timestamp
+        let now = chrono::Utc::now().to_rfc3339();
+        *self.last_reloaded.lock().unwrap() = Some(now);
 
         tracing::info!("Config reloaded successfully");
         Ok(())

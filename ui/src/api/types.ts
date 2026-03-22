@@ -19,7 +19,7 @@ export type RoutingStrategy =
 export interface Provider {
   name: string;
   base_url: string;
-  api_key: string;
+  api_key_masked: string;
   priority: number;
   weight: number;
   enabled: boolean;
@@ -33,6 +33,21 @@ export interface Provider {
 }
 
 /**
+ * Input type for creating/updating providers (includes actual API key).
+ */
+export interface ProviderInput {
+  name?: string;
+  base_url?: string;
+  api_key?: string;
+  priority?: number;
+  weight?: number;
+  enabled?: boolean;
+  models?: string[];
+  headers?: Record<string, string>;
+  token_budget?: number;
+}
+
+/**
  * Per-provider statistics.
  */
 export interface ProviderStats {
@@ -41,6 +56,9 @@ export interface ProviderStats {
   error_rate: number;
   avg_latency_ms: number;
   latency_history: number[];
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
 }
 
 /**
@@ -54,6 +72,11 @@ export interface SystemStats {
   total_providers: number;
   strategy: RoutingStrategy;
   uptime_secs: number;
+  tokens: {
+    prompt: number;
+    completion: number;
+    total: number;
+  };
 }
 
 /**

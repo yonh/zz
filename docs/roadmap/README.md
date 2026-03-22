@@ -23,4 +23,5 @@ Deferred / Future
 
 ## 当前入口
 - [codex-responses/](./codex-responses/) - Codex Responses 的后续规划
+- [code-remediation/](./code-remediation/) - 已完成整改任务拆出的后续事项
 - [historical-plans/](./historical-plans/) - 历史规划批次

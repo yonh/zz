@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import type {
   Provider,
+  ProviderInput,
   SystemStats,
   LogEntry,
   RoutingConfig,
@@ -21,6 +22,11 @@ const defaultSystemStats: SystemStats = {
   total_providers: 0,
   strategy: "failover",
   uptime_secs: 0,
+  tokens: {
+    prompt: 0,
+    completion: 0,
+    total: 0,
+  },
 };
 
 const defaultRoutingConfig: RoutingConfig = {
@@ -70,8 +76,8 @@ interface AppState {
   incrementStats: (success: boolean) => void;
   updateProviderStatus: (name: string, status: ProviderStatus, cooldownUntil: string | null) => void;
   updateProviderStats: (name: string, delta: { addRequest?: boolean; addError?: boolean; latency?: number }) => void;
-  updateProvider: (name: string, updates: Partial<Provider>) => void;
-  addProvider: (provider: Provider) => void;
+  updateProvider: (name: string, updates: ProviderInput) => void;
+  addProvider: (provider: ProviderInput) => void;
   removeProvider: (name: string) => void;
   setSystemStats: (stats: SystemStats) => void;
   setLogs: (logs: LogEntry[]) => void;
@@ -217,6 +223,9 @@ export const useAppStore = create<AppState>((set) => ({
             error_rate: newReqs > 0 ? (newErrs / newReqs) * 100 : 0,
             avg_latency_ms: avgLat,
             latency_history: newLatencyHistory,
+            prompt_tokens: p.stats.prompt_tokens,
+            completion_tokens: p.stats.completion_tokens,
+            total_tokens: p.stats.total_tokens,
           },
         };
       }),
@@ -230,16 +239,42 @@ export const useAppStore = create<AppState>((set) => ({
     })),
 
   addProvider: (provider) =>
-    set((state) => ({
-      providers: [...state.providers, provider],
-      systemStats: {
-        ...state.systemStats,
-        total_providers: state.systemStats.total_providers + 1,
-        active_providers: provider.enabled
-          ? state.systemStats.active_providers + 1
-          : state.systemStats.active_providers,
-      },
-    })),
+    set((state) => {
+      const newProvider: Provider = {
+        name: provider.name || "",
+        base_url: provider.base_url || "",
+        api_key_masked: "****",
+        priority: provider.priority || 1,
+        weight: provider.weight || 50,
+        enabled: provider.enabled ?? true,
+        models: provider.models || [],
+        status: "healthy",
+        cooldown_until: null,
+        consecutive_failures: 0,
+        stats: {
+          total_requests: 0,
+          total_errors: 0,
+          error_rate: 0,
+          avg_latency_ms: 0,
+          latency_history: [],
+          prompt_tokens: 0,
+          completion_tokens: 0,
+          total_tokens: 0,
+        },
+        headers: provider.headers,
+        token_budget: provider.token_budget,
+      };
+      return {
+        providers: [...state.providers, newProvider],
+        systemStats: {
+          ...state.systemStats,
+          total_providers: state.systemStats.total_providers + 1,
+          active_providers: newProvider.enabled
+            ? state.systemStats.active_providers + 1
+            : state.systemStats.active_providers,
+        },
+      };
+    }),
 
   removeProvider: (name) =>
     set((state) => ({
@@ -270,7 +305,14 @@ export const useAppStore = create<AppState>((set) => ({
       ]);
       set({
         providers: providersRes.providers,
-        systemStats: stats,
+        systemStats: {
+          ...defaultSystemStats,
+          ...stats,
+          tokens: {
+            ...defaultSystemStats.tokens,
+            ...(stats.tokens || {}),
+          },
+        },
         routingConfig: routing,
         modelRules: rulesRes.rules,
         configToml: configRes.content,

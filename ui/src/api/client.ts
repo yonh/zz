@@ -1,5 +1,6 @@
 import type {
   Provider,
+  ProviderInput,
   RoutingConfig,
   ModelRule,
   SystemStats,
@@ -25,9 +26,9 @@ export const api = {
     apiFetch<{ providers: Provider[] }>("/providers"),
   getProvider: (name: string) =>
     apiFetch<Provider>(`/providers/${name}`),
-  addProvider: (data: Partial<Provider>) =>
+  addProvider: (data: ProviderInput) =>
     apiFetch<Provider>("/providers", { method: "POST", body: JSON.stringify(data) }),
-  updateProvider: (name: string, data: Partial<Provider>) =>
+  updateProvider: (name: string, data: ProviderInput) =>
     apiFetch<Provider>(`/providers/${name}`, { method: "PUT", body: JSON.stringify(data) }),
   deleteProvider: (name: string) =>
     apiFetch<void>(`/providers/${name}`, { method: "DELETE" }),

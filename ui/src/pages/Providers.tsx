@@ -10,8 +10,6 @@ import {
   CheckCircle2,
   XCircle,
   Ban,
-  Eye,
-  EyeOff,
   GripVertical,
   Loader2,
   X,
@@ -46,7 +44,8 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { useAppStore } from "@/stores/store";
-import type { Provider, ProviderStatus } from "@/api/types";
+import type { Provider, ProviderInput, ProviderStatus } from "@/api/types";
+import { api } from "@/api/client";
 import { cn } from "@/lib/utils";
 
 /**
@@ -106,7 +105,7 @@ function AddProviderModal({ onClose }: { onClose: () => void }) {
   });
   const [error, setError] = useState("");
 
-  function handleSave() {
+  async function handleSave() {
     if (!form.name.trim()) {
       setError("Name is required");
       return;
@@ -119,27 +118,21 @@ function AddProviderModal({ onClose }: { onClose: () => void }) {
       setError("Base URL is required");
       return;
     }
-    addProvider({
-      name: form.name.trim(),
-      base_url: form.base_url.trim(),
-      api_key: form.api_key,
-      priority: form.priority,
-      weight: form.weight,
-      enabled: true,
-      models: form.models.split(",").map((m) => m.trim()).filter(Boolean),
-      status: "healthy",
-      cooldown_until: null,
-      consecutive_failures: 0,
-      stats: {
-        total_requests: 0,
-        total_errors: 0,
-        error_rate: 0,
-        avg_latency_ms: 0,
-        latency_history: [],
-      },
-    });
-    toast.success(`Provider "${form.name.trim()}" added`);
-    onClose();
+    try {
+      const created = await api.addProvider({
+        name: form.name.trim(),
+        base_url: form.base_url.trim(),
+        api_key: form.api_key,
+        priority: form.priority,
+        weight: form.weight,
+        models: form.models.split(",").map((m) => m.trim()).filter(Boolean),
+      });
+      addProvider(created);
+      toast.success(`Provider "${form.name.trim()}" added`);
+      onClose();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to add provider");
+    }
   }
 
   return (
@@ -235,22 +228,28 @@ function EditProviderModal({
   const updateProvider = useAppStore((s) => s.updateProvider);
   const [form, setForm] = useState({
     base_url: provider.base_url,
-    api_key: provider.api_key,
+    api_key: "", // Leave empty to keep existing key
     priority: provider.priority,
     weight: provider.weight,
     models: provider.models.join(", "),
   });
+  const [error, setError] = useState("");
 
-  function handleSave() {
-    updateProvider(provider.name, {
-      base_url: form.base_url,
-      api_key: form.api_key,
-      priority: form.priority,
-      weight: form.weight,
-      models: form.models.split(",").map((m) => m.trim()).filter(Boolean),
-    });
-    toast.success(`Provider "${provider.name}" updated`);
-    onClose();
+  async function handleSave() {
+    try {
+      const updated = await api.updateProvider(provider.name, {
+        base_url: form.base_url,
+        api_key: form.api_key || undefined,
+        priority: form.priority,
+        weight: form.weight,
+        models: form.models.split(",").map((m) => m.trim()).filter(Boolean),
+      });
+      updateProvider(provider.name, updated);
+      toast.success(`Provider "${provider.name}" updated`);
+      onClose();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to update provider");
+    }
   }
 
   return (
@@ -262,6 +261,11 @@ function EditProviderModal({
             <X className="h-4 w-4" />
           </button>
         </div>
+        {error && (
+          <div className="text-sm text-destructive bg-destructive/10 p-2 rounded">
+            {error}
+          </div>
+        )}
         <div className="space-y-3">
           <div className="space-y-1">
             <label className="text-sm font-medium">Base URL</label>
@@ -269,7 +273,13 @@ function EditProviderModal({
           </div>
           <div className="space-y-1">
             <label className="text-sm font-medium">API Key</label>
-            <Input value={form.api_key} onChange={(e) => setForm({ ...form, api_key: e.target.value })} type="password" />
+            <Input
+              value={form.api_key}
+              onChange={(e) => setForm({ ...form, api_key: e.target.value })}
+              type="password"
+              placeholder={`Current: ${provider.api_key_masked}`}
+            />
+            <p className="text-xs text-muted-foreground">Leave empty to keep existing key</p>
           </div>
           <div className="space-y-1">
             <label className="text-sm font-medium">Priority</label>
@@ -339,7 +349,6 @@ function ProviderCard({
   isDragging?: boolean;
 }) {
   const toggleProvider = useAppStore((s) => s.toggleProvider);
-  const [showKey, setShowKey] = useState(false);
   const [testing, setTesting] = useState(false);
   const [editOpen, setEditOpen] = useState(false);
 
@@ -352,36 +361,42 @@ function ProviderCard({
     value: v,
   }));
 
-  const maskedKey = provider.api_key.slice(0, 5) + "****" + provider.api_key.slice(-4);
-
   /**
-   * Simulate a test connection with loading state and result toast.
+   * Test connection to provider via backend API.
    */
-  const handleTestConnection = useCallback(() => {
+  const handleTestConnection = useCallback(async () => {
     setTesting(true);
-    const latency = 300 + Math.floor(Math.random() * 1200);
-    setTimeout(() => {
-      setTesting(false);
-      const success = Math.random() > 0.15;
-      if (success) {
-        toast.success(`${provider.name}: Connection OK (${latency}ms)`);
+    try {
+      const result = await api.testProvider(provider.name);
+      if (result.success) {
+        toast.success(`${provider.name}: Connection OK (${result.latency_ms}ms)`);
       } else {
-        toast.error(`${provider.name}: Connection failed - timeout`);
+        toast.error(`${provider.name}: Connection failed`);
       }
-    }, latency);
+    } catch (err) {
+      toast.error(`${provider.name}: Test failed - ${err instanceof Error ? err.message : "unknown error"}`);
+    } finally {
+      setTesting(false);
+    }
   }, [provider.name]);
 
   /**
    * Toggle enable/disable with toast feedback.
    */
-  const handleToggle = useCallback(() => {
-    toggleProvider(provider.name);
-    if (provider.enabled) {
-      toast.info(`Provider "${provider.name}" disabled`);
-    } else {
-      toast.success(`Provider "${provider.name}" enabled`);
+  const handleToggle = useCallback(async () => {
+    const willEnable = !provider.enabled;
+    try {
+      if (willEnable) {
+        await api.enableProvider(provider.name);
+      } else {
+        await api.disableProvider(provider.name);
+      }
+      toggleProvider(provider.name);
+      toast.success(`${provider.name} ${willEnable ? "enabled" : "disabled"}`);
+    } catch (err) {
+      toast.error(`Failed to ${willEnable ? "enable" : "disable"} provider: ${err instanceof Error ? err.message : "unknown error"}`);
     }
-  }, [toggleProvider, provider.name, provider.enabled]);
+  }, [provider.name, provider.enabled, toggleProvider]);
 
   return (
     <>
@@ -431,17 +446,9 @@ function ProviderCard({
             </div>
             <div className="flex items-center justify-between">
               <span className="text-muted-foreground">API Key</span>
-              <div className="flex items-center gap-1">
-                <span className="font-mono text-xs">
-                  {showKey ? provider.api_key : maskedKey}
-                </span>
-                <button
-                  onClick={() => setShowKey(!showKey)}
-                  className="text-muted-foreground hover:text-foreground transition-colors"
-                >
-                  {showKey ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
-                </button>
-              </div>
+              <span className="font-mono text-xs">
+                {provider.api_key_masked}
+              </span>
             </div>
             <div className="flex items-center justify-between">
               <span className="text-muted-foreground">Models</span>

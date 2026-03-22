@@ -24,6 +24,16 @@ fn json_response<T: serde::Serialize>(data: &T) -> hyper::Response<ResponseBody>
     resp
 }
 
+/// Mask API key for safe display (show first 4 and last 4 chars)
+fn mask_api_key(key: &str) -> String {
+    if key.len() <= 12 {
+        // Too short, just show asterisks
+        "*".repeat(key.len().min(8))
+    } else {
+        format!("{}****{}", &key[..4], &key[key.len()-4..])
+    }
+}
+
 fn error_response(message: &str, status: hyper::StatusCode) -> hyper::Response<ResponseBody> {
     let body = serde_json::json!({ "error": message });
     let mut resp = hyper::Response::new(full(serde_json::to_string(&body).unwrap()));
@@ -93,7 +103,7 @@ pub async fn handle_api_request(
         ("/zz/api/providers", &hyper::Method::POST) => {
             handle_add_provider(req, &state).await
         }
-        (p, &hyper::Method::GET) if p.starts_with("/zz/api/providers/") && p.ends_with("/test") => {
+        (p, &hyper::Method::POST) if p.starts_with("/zz/api/providers/") && p.ends_with("/test") => {
             let name = extract_provider_name(p, "/zz/api/providers/")?;
             handle_test_provider(&name, &state).await
         }
@@ -178,10 +188,14 @@ async fn handle_list_providers(state: &crate::proxy::AppState) -> hyper::Respons
             0.0
         };
 
+        let masked_key = provider_config
+            .map(|p| mask_api_key(&p.api_key))
+            .unwrap_or_default();
+
         serde_json::json!({
             "name": stats.name,
             "base_url": provider_config.map(|p| p.base_url.as_str()).unwrap_or(""),
-            "api_key": provider_config.map(|p| p.api_key.as_str()).unwrap_or(""),
+            "api_key_masked": masked_key,
             "priority": provider_config.map(|p| p.priority).unwrap_or(0),
             "weight": provider_config.map(|p| p.weight).unwrap_or(0),
             "enabled": stats.enabled,
@@ -196,7 +210,10 @@ async fn handle_list_providers(state: &crate::proxy::AppState) -> hyper::Respons
                 "total_errors": stats.error_count,
                 "error_rate": (error_rate * 100.0).round() / 100.0,
                 "avg_latency_ms": stats.avg_latency_ms,
-                "latency_history": stats.latency_history
+                "latency_history": stats.latency_history,
+                "prompt_tokens": stats.prompt_tokens,
+                "completion_tokens": stats.completion_tokens,
+                "total_tokens": stats.prompt_tokens + stats.completion_tokens
             }
         })
     }).collect();
@@ -224,7 +241,7 @@ async fn handle_get_provider(name: &str, state: &crate::proxy::AppState) -> hype
     let provider = serde_json::json!({
         "name": stats.name,
         "base_url": provider_config.map(|p| p.base_url.as_str()).unwrap_or(""),
-        "api_key": provider_config.map(|p| p.api_key.as_str()).unwrap_or(""),
+        "api_key_masked": provider_config.map(|p| mask_api_key(&p.api_key)).unwrap_or_default(),
         "priority": provider_config.map(|p| p.priority).unwrap_or(0),
         "weight": provider_config.map(|p| p.weight).unwrap_or(0),
         "enabled": stats.enabled,
@@ -239,7 +256,10 @@ async fn handle_get_provider(name: &str, state: &crate::proxy::AppState) -> hype
             "total_errors": stats.error_count,
             "error_rate": (error_rate * 100.0).round() / 100.0,
             "avg_latency_ms": stats.avg_latency_ms,
-            "latency_history": stats.latency_history
+            "latency_history": stats.latency_history,
+            "prompt_tokens": stats.prompt_tokens,
+            "completion_tokens": stats.completion_tokens,
+            "total_tokens": stats.prompt_tokens + stats.completion_tokens
         }
     });
 
@@ -313,7 +333,7 @@ async fn handle_add_provider(
             let mut resp = json_response(&serde_json::json!({
                 "name": new_config.name,
                 "base_url": new_config.base_url,
-                "api_key": new_config.api_key,
+                "api_key_masked": mask_api_key(&new_config.api_key),
                 "priority": new_config.priority,
                 "weight": new_config.weight,
                 "enabled": true,
@@ -328,7 +348,10 @@ async fn handle_add_provider(
                     "total_errors": 0,
                     "error_rate": 0.0,
                     "avg_latency_ms": 0,
-                    "latency_history": []
+                    "latency_history": [],
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0
                 }
             }));
             *resp.status_mut() = hyper::StatusCode::CREATED;
@@ -630,6 +653,9 @@ async fn handle_get_stats(state: &crate::proxy::AppState) -> hyper::Response<Res
         .count();
     let total_providers = all_stats.len();
 
+    // Get total token usage
+    let (total_prompt_tokens, total_completion_tokens) = state.provider_manager.get_total_tokens();
+
     let config = state.config.read().unwrap();
 
     json_response(&serde_json::json!({
@@ -639,7 +665,12 @@ async fn handle_get_stats(state: &crate::proxy::AppState) -> hyper::Response<Res
         "healthy_providers": healthy_providers,
         "total_providers": total_providers,
         "strategy": config.routing.strategy,
-        "uptime_secs": state.start_time.elapsed().as_secs()
+        "uptime_secs": state.start_time.elapsed().as_secs(),
+        "tokens": {
+            "prompt": total_prompt_tokens,
+            "completion": total_completion_tokens,
+            "total": total_prompt_tokens + total_completion_tokens
+        }
     }))
 }
 
@@ -705,11 +736,15 @@ async fn handle_get_config(state: &crate::proxy::AppState) -> hyper::Response<Re
         })
         .unwrap_or_default();
 
+    let last_reloaded = state.last_reloaded.lock().unwrap()
+        .clone()
+        .unwrap_or_else(|| last_modified.clone());
+
     json_response(&serde_json::json!({
         "content": content,
         "path": state.config_path,
         "last_modified": last_modified,
-        "last_reloaded": last_modified  // Could track separately
+        "last_reloaded": last_reloaded
     }))
 }
 
@@ -737,10 +772,13 @@ async fn handle_update_config(
     match crate::config::Config::load_from_str(&update_req.content) {
         Ok(_) => {},
         Err(e) => {
-            return json_response(&serde_json::json!({
+            let body = serde_json::json!({
                 "saved": false,
                 "error": format!("TOML parse error: {}", e)
-            }));
+            });
+            let mut resp = json_response(&body);
+            *resp.status_mut() = hyper::StatusCode::BAD_REQUEST;
+            return resp;
         }
     }
 
