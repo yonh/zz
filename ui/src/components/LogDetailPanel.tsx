@@ -8,7 +8,7 @@ import type { LogEntry } from "@/api/types";
  */
 export function LogDetailPanel({ log }: { log: LogEntry }) {
   return (
-    <div className="px-4 py-3 bg-muted/30 border-t text-xs space-y-2">
+    <div className="px-4 py-3 bg-muted/30 border-t text-xs space-y-3">
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
         <div>
           <span className="text-muted-foreground">Request ID</span>
@@ -59,6 +59,18 @@ export function LogDetailPanel({ log }: { log: LogEntry }) {
           </div>
         )}
       </div>
+
+      {/* Token Usage Detail */}
+      {log.token_usage && (
+        <div className="border-t pt-3 mt-2">
+          <span className="text-muted-foreground font-medium">Token Usage</span>
+          <div className="mt-2 bg-muted/50 rounded-md p-3 overflow-x-auto">
+            <pre className="font-mono text-[11px] text-foreground/90 whitespace-pre-wrap break-all">
+              {JSON.stringify(log.token_usage, null, 2)}
+            </pre>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

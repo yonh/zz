@@ -26,7 +26,7 @@ import {
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { LogDetailPanel } from "@/components/LogDetailPanel";
-import { Select } from "@/components/ui/select";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { useAppStore } from "@/stores/store";
 import { cn, formatDuration } from "@/lib/utils";
 import { toast } from "sonner";
@@ -159,13 +159,13 @@ export default function Overview() {
   }, [providers, chartColors]);
 
   return (
-    <div className="space-y-6">
-      <div className="flex items-center justify-between">
+    <div className="flex flex-col flex-1 overflow-hidden gap-6">
+      <div className="flex items-center justify-between shrink-0">
         <h1 className="text-2xl font-bold tracking-tight">Overview</h1>
       </div>
 
       {/* Stats Cards */}
-      <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
+      <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4 shrink-0">
         <Card>
           <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
             <CardTitle className="text-sm font-medium">Total Requests</CardTitle>
@@ -219,10 +219,19 @@ export default function Overview() {
           <CardContent>
             <Select
               value={systemStats.strategy}
-              onChange={(e) => handleStrategyChange(e.target.value)}
-              options={strategyOptions}
-              className="h-8 text-sm"
-            />
+              onValueChange={handleStrategyChange}
+            >
+              <SelectTrigger className="h-8 text-sm">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {strategyOptions.map((opt) => (
+                  <SelectItem key={opt.value} value={opt.value}>
+                    {opt.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
             <p className="text-xs text-muted-foreground mt-1">
               Uptime: {Math.floor(systemStats.uptime_secs / 3600)}h{" "}
               {Math.floor((systemStats.uptime_secs % 3600) / 60)}m
@@ -232,7 +241,7 @@ export default function Overview() {
       </div>
 
       {/* Charts Row */}
-      <div className="grid gap-4 lg:grid-cols-7">
+      <div className="grid gap-4 lg:grid-cols-7 shrink-0">
         <Card className="lg:col-span-4">
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
@@ -340,16 +349,16 @@ export default function Overview() {
       </div>
 
       {/* Activity Feed */}
-      <Card>
-        <CardHeader>
+      <Card className="flex-1 flex flex-col min-h-0">
+        <CardHeader className="shrink-0">
           <CardTitle className="flex items-center gap-2">
             Recent Activity
             <Radio className="h-4 w-4 text-primary animate-pulse" />
             <span className="text-xs font-normal text-muted-foreground">Live</span>
           </CardTitle>
         </CardHeader>
-        <CardContent>
-          <div className="space-y-1 max-h-[400px] overflow-y-auto">
+        <CardContent className="flex-1 flex flex-col min-h-0">
+          <div className="space-y-1 flex-1 overflow-y-auto min-h-0">
             {recentLogs.map((log) => {
               const isExpanded = expandedId === log.id;
               return (
@@ -393,6 +402,9 @@ export default function Overview() {
                     </span>
                     <span className="text-xs text-muted-foreground w-16 text-right shrink-0">
                       {formatDuration(log.duration_ms)}
+                    </span>
+                    <span className="text-xs text-muted-foreground w-14 text-right shrink-0 font-mono">
+                      {log.token_usage ? log.token_usage.total_tokens.toLocaleString() : "-"}
                     </span>
                     {log.failover_chain && (
                       <div className="flex items-center gap-1">

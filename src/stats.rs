@@ -3,6 +3,17 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
 
+/// Token usage information from API response
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+pub struct TokenUsage {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+    /// Optional detailed breakdown (cached, reasoning, etc.)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
+}
+
 /// A single log entry for a request
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LogEntry {
@@ -19,6 +30,9 @@ pub struct LogEntry {
     pub request_bytes: u64,
     pub response_bytes: u64,
     pub failover_chain: Option<Vec<String>>,
+    /// Token usage from API response (if available)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_usage: Option<TokenUsage>,
 }
 
 /// Thread-safe ring buffer for request logs
@@ -157,6 +171,7 @@ mod tests {
                 request_bytes: 100,
                 response_bytes: 200,
                 failover_chain: None,
+                token_usage: None,
             });
         }
 
@@ -184,6 +199,7 @@ mod tests {
                 request_bytes: 100,
                 response_bytes: 200,
                 failover_chain: None,
+                token_usage: None,
             });
         }
 
@@ -212,6 +228,7 @@ mod tests {
                 request_bytes: 100,
                 response_bytes: 200,
                 failover_chain: None,
+                token_usage: None,
             });
         }
 

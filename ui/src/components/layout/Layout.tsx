@@ -28,8 +28,8 @@ export default function Layout() {
   const toggleDarkMode = useAppStore((s) => s.toggleDarkMode);
 
   return (
-    <div className="min-h-screen bg-background">
-      <header className="sticky top-0 z-50 border-b bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60">
+    <div className="h-screen bg-background flex flex-col overflow-hidden">
+      <header className="shrink-0 z-50 border-b bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60">
         <div className="flex h-14 items-center px-6">
           <div className="flex items-center gap-2 mr-8">
             <Zap className="h-5 w-5 text-chart-1" />
@@ -77,7 +77,7 @@ export default function Layout() {
         </div>
       </header>
 
-      <main className="p-6">
+      <main className="p-6 flex-1 flex flex-col overflow-hidden">
         <Outlet />
       </main>
     </div>

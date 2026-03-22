@@ -30,7 +30,7 @@ import { toast } from "sonner";
  */
 function LogDetailPanel({ log }: { log: LogEntry }) {
   return (
-    <div className="px-4 py-3 bg-muted/30 border-t text-xs space-y-2">
+    <div className="px-4 py-3 bg-muted/30 border-t text-xs space-y-3">
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
         <div>
           <span className="text-muted-foreground">Request ID</span>
@@ -81,6 +81,18 @@ function LogDetailPanel({ log }: { log: LogEntry }) {
           </div>
         )}
       </div>
+
+      {/* Token Usage Detail */}
+      {log.token_usage && (
+        <div className="border-t pt-3 mt-2">
+          <span className="text-muted-foreground font-medium">Token Usage</span>
+          <div className="mt-2 bg-muted/50 rounded-md p-3 overflow-x-auto">
+            <pre className="font-mono text-[11px] text-foreground/90 whitespace-pre-wrap break-all">
+              {JSON.stringify(log.token_usage, null, 2)}
+            </pre>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -149,8 +161,8 @@ export default function Logs() {
   }
 
   return (
-    <div className="space-y-6">
-      <div className="flex items-center justify-between">
+    <div className="flex flex-col flex-1 overflow-hidden gap-6">
+      <div className="flex items-center justify-between shrink-0">
         <h1 className="text-2xl font-bold tracking-tight">Logs</h1>
         <div className="flex items-center gap-2">
           <Button
@@ -176,7 +188,7 @@ export default function Logs() {
       </div>
 
       {/* Filters */}
-      <Card>
+      <Card className="shrink-0">
         <CardContent className="pt-4 pb-4">
           <div className="flex items-center gap-3">
             <Filter className="h-4 w-4 text-muted-foreground shrink-0" />
@@ -221,21 +233,22 @@ export default function Logs() {
       </Card>
 
       {/* Log Table */}
-      <Card>
-        <CardHeader className="pb-0">
+      <Card className="flex-1 flex flex-col min-h-0">
+        <CardHeader className="pb-0 shrink-0">
           <CardTitle>Request Log</CardTitle>
         </CardHeader>
-        <CardContent className="pt-4">
-          <div ref={scrollContainerRef} className="rounded-md border max-h-[600px] overflow-y-auto">
+        <CardContent className="pt-4 flex-1 flex flex-col min-h-0">
+          <div ref={scrollContainerRef} className="rounded-md border flex-1 overflow-y-auto min-h-0">
             {/* Header */}
-            <div className="grid grid-cols-[24px_90px_56px_120px_1fr_70px_70px] gap-2 px-3 py-2 border-b bg-muted/50 text-xs font-medium text-muted-foreground sticky top-0 z-10">
+            <div className="grid grid-cols-[24px_90px_56px_120px_100px_1fr_70px_60px] gap-2 px-3 py-2 border-b bg-muted/50 text-xs font-medium text-muted-foreground sticky top-0 z-10">
               <span />
               <span>Time</span>
               <span>Status</span>
               <span>Provider</span>
+              <span>Model</span>
               <span>Path</span>
               <span className="text-right">Duration</span>
-              <span className="text-right">Model</span>
+              <span className="text-right">Tokens</span>
             </div>
 
             {/* Rows */}
@@ -245,7 +258,7 @@ export default function Logs() {
                 <div key={log.id}>
                   <div
                     className={cn(
-                      "grid grid-cols-[24px_90px_56px_120px_1fr_70px_70px] gap-2 px-3 py-2 border-b text-sm items-center cursor-pointer hover:bg-accent/30 transition-colors",
+                      "grid grid-cols-[24px_90px_56px_120px_100px_1fr_70px_60px] gap-2 px-3 py-2 border-b text-sm items-center cursor-pointer hover:bg-accent/30 transition-colors",
                       isExpanded && "bg-accent/20",
                       log.failover_chain && "bg-amber-500/5"
                     )}
@@ -274,14 +287,17 @@ export default function Logs() {
                     <span className="font-mono text-xs truncate">
                       {log.provider}
                     </span>
+                    <span className="font-mono text-xs truncate text-muted-foreground">
+                      {log.model}
+                    </span>
                     <span className="font-mono text-xs truncate">
                       {log.method} {log.path}
                     </span>
                     <span className="font-mono text-xs text-right text-muted-foreground">
                       {log.duration_ms}ms
                     </span>
-                    <span className="font-mono text-xs text-right truncate text-muted-foreground">
-                      {log.model}
+                    <span className="font-mono text-xs text-right text-muted-foreground">
+                      {log.token_usage ? log.token_usage.total_tokens.toLocaleString() : "-"}
                     </span>
                   </div>
                   {isExpanded && <LogDetailPanel log={log} />}

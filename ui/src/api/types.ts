@@ -57,6 +57,22 @@ export interface SystemStats {
 }
 
 /**
+ * Token usage information from API response.
+ */
+export interface TokenUsage {
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  details?: {
+    cached_tokens?: number;
+    reasoning_tokens?: number;
+    cache_read_tokens?: number;
+    cache_write_tokens?: number;
+    [key: string]: number | undefined;
+  };
+}
+
+/**
  * A single request log entry.
  */
 export interface LogEntry {
@@ -73,6 +89,7 @@ export interface LogEntry {
   request_bytes: number;
   response_bytes: number;
   failover_chain: string[] | null;
+  token_usage?: TokenUsage;
 }
 
 /**

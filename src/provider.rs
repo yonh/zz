@@ -161,6 +161,12 @@ impl Provider {
             latency_history: self.get_latency_history(),
         }
     }
+
+    /// Check if this provider supports the given model.
+    /// Uses glob patterns from config (e.g., "gpt-4*" matches "gpt-4-turbo").
+    pub fn supports_model(&self, model: &str) -> bool {
+        crate::router::provider_supports_model(&self.config.models, model)
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -198,6 +204,19 @@ impl ProviderManager {
         self.providers
             .iter()
             .filter(|entry| entry.value().is_available())
+            .map(|entry| (entry.key().clone(), Arc::clone(entry.value())))
+            .collect()
+    }
+
+    /// Get all available providers that support a specific model.
+    /// Filters providers by their declared model support (from config).
+    pub fn get_available_for_model(&self, model: &str) -> Vec<(String, Arc<Provider>)> {
+        self.providers
+            .iter()
+            .filter(|entry| {
+                let p = entry.value();
+                p.is_available() && p.supports_model(model)
+            })
             .map(|entry| (entry.key().clone(), Arc::clone(entry.value())))
             .collect()
     }

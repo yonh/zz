@@ -52,11 +52,45 @@ pub async fn proxy_handler(
     let mut tried_providers: HashSet<String> = HashSet::new();
     let mut last_error: Option<crate::error::ProxyError> = None;
 
+    // Pre-filter providers by model support
+    let base_providers: Vec<_> = if model != "unknown" {
+        let model_providers = state.provider_manager.get_available_for_model(&model);
+        if model_providers.is_empty() {
+            // Check if any provider even declares support for this model
+            let has_support = state.provider_manager.get_all_stats().iter()
+                .any(|s| state.provider_manager.get_by_name(&s.name)
+                    .map(|p| p.supports_model(&model))
+                    .unwrap_or(false));
+
+            if !has_support {
+                tracing::warn!(model = %model, "No provider configured to support this model");
+                let error_body = serde_json::json!({
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": format!("No provider is configured to support model: {}", model)
+                    }
+                });
+                return Ok(hyper::Response::builder()
+                    .status(hyper::StatusCode::BAD_REQUEST)
+                    .header("content-type", "application/json")
+                    .body(full(error_body.to_string()))
+                    .unwrap());
+            }
+            tracing::warn!(
+                model = %model,
+                "All providers supporting this model are currently unavailable"
+            );
+        }
+        model_providers
+    } else {
+        state.provider_manager.get_available()
+    };
+
     for _ in 0..max_retries {
-        // Get available providers (excluding already tried ones)
-        let providers: Vec<_> = state.provider_manager.get_available()
-            .into_iter()
+        // Get providers (excluding already tried ones)
+        let providers: Vec<_> = base_providers.iter()
             .filter(|(name, _)| !tried_providers.contains(name))
+            .cloned()
             .collect();
 
         if providers.is_empty() {
@@ -115,7 +149,7 @@ pub async fn proxy_handler(
             is_sse,
             request_timeout_secs,
         ).await {
-            Ok((response, resp_bytes, resp_ttfb_ms)) => {
+            Ok((response, resp_bytes, resp_ttfb_ms, token_usage)) => {
                 let status_code = response.status().as_u16();
                 failover_chain.push(format!("{}:{}", provider_name, status_code));
                 final_provider = provider_name.clone();
@@ -146,6 +180,7 @@ pub async fn proxy_handler(
                     } else {
                         None
                     },
+                    token_usage,
                 };
                 state.log_buffer.push(log_entry.clone());
                 state.rpm_counter.increment();
@@ -185,6 +220,7 @@ pub async fn proxy_handler(
         request_bytes,
         response_bytes: 0,
         failover_chain: if failover_chain.len() > 1 { Some(failover_chain) } else { None },
+        token_usage: None,
     };
     state.log_buffer.push(log_entry.clone());
     state.rpm_counter.increment();
@@ -210,8 +246,8 @@ async fn attempt_request(
     state: &AppState,
     is_sse: bool,
     request_timeout_secs: u64,
-) -> Result<(hyper::Response<ResponseBody>, u64, u64), crate::error::ProxyError> {
-    // Returns: (response, response_bytes, ttfb_ms)
+) -> Result<(hyper::Response<ResponseBody>, u64, u64, Option<crate::stats::TokenUsage>), crate::error::ProxyError> {
+    // Returns: (response, response_bytes, ttfb_ms, token_usage)
     // Rewrite URL
     let upstream_url = crate::rewriter::RequestRewriter::rewrite_url(
         &provider.config.base_url,
@@ -306,9 +342,11 @@ async fn attempt_request(
         }
 
         let resp_bytes = response_bytes.len() as u64;
+        // Try to extract token usage from error response (some APIs include it)
+        let token_usage = extract_token_usage(&response_bytes);
         return Ok((downstream_response
             .body(full(response_bytes))
-            .unwrap(), resp_bytes, ttfb_ms));
+            .unwrap(), resp_bytes, ttfb_ms, token_usage));
     }
 
     // Success response
@@ -336,10 +374,10 @@ async fn attempt_request(
             downstream_response = downstream_response.header(name, value);
         }
 
-        // response_bytes unknown for streaming
+        // response_bytes unknown for streaming, token usage typically in last SSE event
         Ok((downstream_response
             .body(body)
-            .unwrap(), 0, ttfb_ms))
+            .unwrap(), 0, ttfb_ms, None))
     } else {
         // Buffer response for non-SSE
         let resp_bytes = response.collect().await
@@ -348,6 +386,9 @@ async fn attempt_request(
 
         let response_bytes_val = resp_bytes.len() as u64;
 
+        // Extract token usage from response
+        let token_usage = extract_token_usage(&resp_bytes);
+
         let mut downstream_response = hyper::Response::builder().status(status);
         for (name, value) in response_headers.iter() {
             downstream_response = downstream_response.header(name, value);
@@ -355,7 +396,7 @@ async fn attempt_request(
 
         Ok((downstream_response
             .body(full(resp_bytes))
-            .unwrap(), response_bytes_val, ttfb_ms))
+            .unwrap(), response_bytes_val, ttfb_ms, token_usage))
     }
 }
 
@@ -440,15 +481,70 @@ fn select_with_rules(
 
 
 fn extract_model(body: &[u8]) -> String {
-    let check_len = body.len().min(2048);
-    if let Ok(s) = std::str::from_utf8(&body[..check_len]) {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(s) {
-            if let Some(m) = v.get("model").and_then(|m| m.as_str()) {
-                return m.to_string();
+    // Try to parse as UTF-8 first
+    let Ok(s) = std::str::from_utf8(body) else {
+        tracing::debug!("Request body is not valid UTF-8");
+        return "unknown".to_string();
+    };
+
+    // Try to parse as JSON (works for small/medium bodies)
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(s) {
+        if let Some(m) = v.get("model").and_then(|m| m.as_str()) {
+            return m.to_string();
+        }
+        tracing::debug!("No 'model' field in request JSON");
+        return "unknown".to_string();
+    }
+
+    // For large bodies or partial JSON, search for "model" field directly
+    // This handles cases where full JSON parsing fails or is too expensive
+    tracing::debug!("Full JSON parse failed, searching for model field directly");
+
+    // Look for "model": "value" pattern
+    if let Some(model) = extract_model_from_partial_json(s) {
+        return model;
+    }
+
+    "unknown".to_string()
+}
+
+/// Extract model value by searching for "model": "value" pattern in JSON string.
+/// This is a fallback for when full JSON parsing fails.
+fn extract_model_from_partial_json(s: &str) -> Option<String> {
+    // Find "model" key with various whitespace patterns
+    let patterns = ["\"model\"", "'model'"];
+
+    for pattern in patterns {
+        let mut pos = 0;
+        while let Some(idx) = s[pos..].find(pattern) {
+            let key_end = pos + idx + pattern.len();
+
+            // Skip whitespace and find colon
+            let after_key = &s[key_end..];
+            let colon_pos = after_key.find(':')?;
+
+            // Skip whitespace after colon
+            let after_colon = &after_key[colon_pos + 1..];
+            let trimmed = after_colon.trim_start();
+
+            // Extract quoted string value
+            if trimmed.starts_with('"') {
+                if let Some(end) = trimmed[1..].find('"') {
+                    let value = &trimmed[1..end + 1];
+                    return Some(value.to_string());
+                }
+            } else if trimmed.starts_with('\'') {
+                if let Some(end) = trimmed[1..].find('\'') {
+                    let value = &trimmed[1..end + 1];
+                    return Some(value.to_string());
+                }
             }
+
+            pos = key_end;
         }
     }
-    "unknown".to_string()
+
+    None
 }
 
 /// Generate a short random request ID.
@@ -462,4 +558,114 @@ fn generate_request_id() -> String {
         })
         .collect();
     format!("req_{}", id)
+}
+
+/// Extract token usage from API response body.
+/// Supports OpenAI-style and Anthropic-style usage objects.
+fn extract_token_usage(body: &[u8]) -> Option<crate::stats::TokenUsage> {
+    // Try to parse as UTF-8
+    let Ok(s) = std::str::from_utf8(body) else {
+        return None;
+    };
+
+    // Try to parse as JSON
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(s) else {
+        return None;
+    };
+
+    // Try OpenAI-style usage object: { "usage": { "prompt_tokens": N, "completion_tokens": M, "total_tokens": T } }
+    if let Some(usage) = v.get("usage") {
+        return extract_usage_from_object(usage);
+    }
+
+    // Try Anthropic-style: usage at top level with different field names
+    // Anthropic: { "usage": { "input_tokens": N, "output_tokens": M } }
+    if let Some(usage) = v.get("usage") {
+        let prompt = usage.get("input_tokens").and_then(|v| v.as_u64())
+            .or_else(|| usage.get("prompt_tokens").and_then(|v| v.as_u64()));
+        let completion = usage.get("output_tokens").and_then(|v| v.as_u64())
+            .or_else(|| usage.get("completion_tokens").and_then(|v| v.as_u64()));
+
+        if let (Some(p), Some(c)) = (prompt, completion) {
+            let total = usage.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(p + c);
+
+            // Extract additional details if present
+            let details = extract_usage_details(usage);
+
+            return Some(crate::stats::TokenUsage {
+                prompt_tokens: p,
+                completion_tokens: c,
+                total_tokens: total,
+                details,
+            });
+        }
+    }
+
+    // Some APIs return usage directly in response (not nested)
+    if v.get("prompt_tokens").is_some() || v.get("input_tokens").is_some() {
+        return extract_usage_from_object(&v);
+    }
+
+    None
+}
+
+/// Extract usage from a usage object (OpenAI or Anthropic style)
+fn extract_usage_from_object(usage: &serde_json::Value) -> Option<crate::stats::TokenUsage> {
+    let prompt = usage.get("prompt_tokens").and_then(|v| v.as_u64())
+        .or_else(|| usage.get("input_tokens").and_then(|v| v.as_u64()));
+    let completion = usage.get("completion_tokens").and_then(|v| v.as_u64())
+        .or_else(|| usage.get("output_tokens").and_then(|v| v.as_u64()));
+
+    match (prompt, completion) {
+        (Some(p), Some(c)) => {
+            let total = usage.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(p + c);
+            let details = extract_usage_details(usage);
+            Some(crate::stats::TokenUsage {
+                prompt_tokens: p,
+                completion_tokens: c,
+                total_tokens: total,
+                details,
+            })
+        }
+        (Some(p), None) => {
+            // Only prompt tokens available (might be embedding request)
+            let total = usage.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(p);
+            Some(crate::stats::TokenUsage {
+                prompt_tokens: p,
+                completion_tokens: 0,
+                total_tokens: total,
+                details: None,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Extract additional usage details (cached tokens, reasoning tokens, etc.)
+fn extract_usage_details(usage: &serde_json::Value) -> Option<serde_json::Value> {
+    let mut details = serde_json::Map::new();
+
+    // OpenAI cached tokens
+    if let Some(cached) = usage.get("prompt_tokens_details").and_then(|v| v.get("cached_tokens")).and_then(|v| v.as_u64()) {
+        details.insert("cached_tokens".to_string(), serde_json::Value::Number(cached.into()));
+    }
+
+    // OpenAI reasoning tokens
+    if let Some(reasoning) = usage.get("completion_tokens_details").and_then(|v| v.get("reasoning_tokens")).and_then(|v| v.as_u64()) {
+        details.insert("reasoning_tokens".to_string(), serde_json::Value::Number(reasoning.into()));
+    }
+
+    // Anthropic cache read/write
+    if let Some(cache_read) = usage.get("cache_read_input_tokens").and_then(|v| v.as_u64()) {
+        details.insert("cache_read_tokens".to_string(), serde_json::Value::Number(cache_read.into()));
+    }
+    if let Some(cache_write) = usage.get("cache_creation_input_tokens").and_then(|v| v.as_u64()) {
+        details.insert("cache_write_tokens".to_string(), serde_json::Value::Number(cache_write.into()));
+    }
+
+    if details.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::Object(details))
+    }
 }

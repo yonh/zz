@@ -158,3 +158,13 @@ fn glob_match(pattern: &str, text: &str) -> bool {
 
     pattern_idx == pattern_chars.len() && text_idx == text_chars.len()
 }
+
+/// Check if a provider supports a given model.
+/// Uses glob patterns (e.g., "gpt-4*" matches "gpt-4-turbo").
+/// Empty models list means supports all (backward compatible).
+pub fn provider_supports_model(provider_models: &[String], model: &str) -> bool {
+    if provider_models.is_empty() {
+        return true; // Empty = supports all (backward compatible)
+    }
+    provider_models.iter().any(|p| glob_match(p, model))
+}
