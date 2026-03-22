@@ -155,9 +155,13 @@ export const useAppStore = create<AppState>((set) => ({
     }),
 
   addLog: (log) =>
-    set((state) => ({
-      logs: [log, ...state.logs].slice(0, 1000),
-    })),
+    set((state) => {
+      // Skip if log with same ID already exists
+      if (state.logs.some((l) => l.id === log.id)) {
+        return state;
+      }
+      return { logs: [log, ...state.logs].slice(0, 1000) };
+    }),
 
   reorderProviders: (orderedNames) =>
     set((state) => ({

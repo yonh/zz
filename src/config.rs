@@ -29,6 +29,14 @@ pub struct RoutingConfig {
     pub max_retries: usize,
     #[serde(default)]
     pub pinned_provider: Option<String>,
+    #[serde(default)]
+    pub rules: Vec<ModelRuleConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+pub struct ModelRuleConfig {
+    pub pattern: String,
+    pub target_provider: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]

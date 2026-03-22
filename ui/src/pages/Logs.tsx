@@ -13,7 +13,13 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Select } from "@/components/ui/select";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { useAppStore } from "@/stores/store";
 import type { LogEntry } from "@/api/types";
 import { cn } from "@/lib/utils";
@@ -126,12 +132,6 @@ export default function Logs() {
     ...providers.map((p) => ({ value: p.name, label: p.name })),
   ];
 
-  // Auto-scroll to top when new logs arrive and autoScroll is enabled
-  useEffect(() => {
-    if (autoScroll && scrollContainerRef.current) {
-      scrollContainerRef.current.scrollTop = 0;
-    }
-  }, [logs, autoScroll]);
 
   /**
    * Export filtered logs as JSON file download.
@@ -180,18 +180,30 @@ export default function Logs() {
         <CardContent className="pt-4 pb-4">
           <div className="flex items-center gap-3">
             <Filter className="h-4 w-4 text-muted-foreground shrink-0" />
-            <Select
-              value={statusFilter}
-              onChange={(e) => setStatusFilter(e.target.value)}
-              options={statusOptions}
-              className="w-40 h-9"
-            />
-            <Select
-              value={providerFilter}
-              onChange={(e) => setProviderFilter(e.target.value)}
-              options={providerOptions}
-              className="w-44 h-9"
-            />
+            <Select value={statusFilter} onValueChange={setStatusFilter}>
+              <SelectTrigger className="w-40 h-9">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {statusOptions.map((opt) => (
+                  <SelectItem key={opt.value} value={opt.value}>
+                    {opt.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <Select value={providerFilter} onValueChange={setProviderFilter}>
+              <SelectTrigger className="w-44 h-9">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {providerOptions.map((opt) => (
+                  <SelectItem key={opt.value} value={opt.value}>
+                    {opt.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
             <div className="relative flex-1">
               <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground" />
               <Input

@@ -63,10 +63,31 @@ pub async fn proxy_handler(
             break;
         }
 
-        // Select provider based on routing strategy
-        let (provider_name, provider) = match state.router.select_provider(&providers) {
-            Some(p) => p,
-            None => break,
+        // Select provider based on model rules first, then routing strategy
+        let (provider_name, provider) = {
+            let rules = state.model_rules.read().unwrap();
+            tracing::debug!(
+                model = %model,
+                rules_count = rules.len(),
+                "Selecting provider for model"
+            );
+            match select_with_rules(&model, &providers, &rules, &state.router) {
+                SelectResult::Provider(p) => p,
+                SelectResult::RuleMatchedButUnavailable(target) => {
+                    tracing::warn!(
+                        model = %model,
+                        target_provider = %target,
+                        "Model rule matched but target provider is unavailable, stopping retry"
+                    );
+                    break;
+                }
+                SelectResult::NoRule => {
+                    match state.router.select_provider(&providers) {
+                        Some(p) => p,
+                        None => break,
+                    }
+                }
+            }
         };
 
         tried_providers.insert(provider_name.clone());
@@ -359,6 +380,18 @@ impl AppState {
         // Update provider manager
         self.provider_manager.reload(&new_config);
 
+        // Sync model rules from config (config file is authoritative on reload)
+        let new_rules: Vec<crate::router::ModelRule> = new_config.routing.rules
+            .iter()
+            .enumerate()
+            .map(|(i, r)| crate::router::ModelRule {
+                id: format!("rule_{}", i + 1),
+                pattern: r.pattern.clone(),
+                target_provider: r.target_provider.clone(),
+            })
+            .collect();
+        *self.model_rules.write().unwrap() = new_rules;
+
         // Update config
         {
             let mut config = self.config.write().unwrap();
@@ -370,7 +403,42 @@ impl AppState {
     }
 }
 
-/// Best-effort extract "model" field from request body JSON (check first 2KB).
+/// Result of provider selection with model rules.
+enum SelectResult {
+    /// A matching provider was found.
+    Provider((String, Arc<crate::provider::Provider>)),
+    /// A rule matched, but the designated provider is not currently available.
+    RuleMatchedButUnavailable(String),
+    /// No rule matched — caller should fall back to default strategy.
+    NoRule,
+}
+
+/// Select a provider using model rules; returns SelectResult so the caller can
+/// distinguish between "rule matched but target unavailable" and "no rule".
+fn select_with_rules(
+    model: &str,
+    providers: &[(String, Arc<crate::provider::Provider>)],
+    rules: &[crate::router::ModelRule],
+    router: &crate::router::Router,
+) -> SelectResult {
+    for rule in rules {
+        if crate::router::glob_match_pub(&rule.pattern, model) {
+            tracing::info!(
+                model = %model,
+                pattern = %rule.pattern,
+                target = %rule.target_provider,
+                "Model rule matched"
+            );
+            return match providers.iter().find(|(name, _)| name == &rule.target_provider) {
+                Some((name, p)) => SelectResult::Provider((name.clone(), Arc::clone(p))),
+                None => SelectResult::RuleMatchedButUnavailable(rule.target_provider.clone()),
+            };
+        }
+    }
+    SelectResult::NoRule
+}
+
+
 fn extract_model(body: &[u8]) -> String {
     let check_len = body.len().min(2048);
     if let Ok(s) = std::str::from_utf8(&body[..check_len]) {

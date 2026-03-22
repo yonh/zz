@@ -601,6 +601,15 @@ async fn handle_update_rules(
         })
     }).collect();
 
+    // Sync to config memory so GET /zz/api/config reflects current rules
+    {
+        let mut config = state.config.write().unwrap();
+        config.routing.rules = new_rules.iter().map(|r| crate::config::ModelRuleConfig {
+            pattern: r.pattern.clone(),
+            target_provider: r.target_provider.clone(),
+        }).collect();
+    }
+
     // Store in state
     *state.model_rules.write().unwrap() = new_rules;
 

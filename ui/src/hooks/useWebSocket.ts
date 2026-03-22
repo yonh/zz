@@ -8,8 +8,13 @@ export function useWebSocket() {
   const setSystemStats = useAppStore((s) => s.setSystemStats);
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimeout = useRef<number>(1000);
+  const mountedRef = useRef(false);
 
   useEffect(() => {
+    // Skip double-mount in StrictMode
+    if (mountedRef.current) return;
+    mountedRef.current = true;
+
     function connect() {
       const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
       const ws = new WebSocket(`${protocol}//${window.location.host}/zz/ws`);
@@ -20,8 +25,10 @@ export function useWebSocket() {
       };
 
       ws.onclose = () => {
-        setTimeout(connect, reconnectTimeout.current);
-        reconnectTimeout.current = Math.min(reconnectTimeout.current * 2, 30000);
+        if (mountedRef.current) {
+          setTimeout(connect, reconnectTimeout.current);
+          reconnectTimeout.current = Math.min(reconnectTimeout.current * 2, 30000);
+        }
       };
 
       ws.onmessage = (event) => {
@@ -45,6 +52,9 @@ export function useWebSocket() {
     }
 
     connect();
-    return () => wsRef.current?.close();
+    return () => {
+      mountedRef.current = false;
+      wsRef.current?.close();
+    };
   }, [addLog, updateProviderStatus, setSystemStats]);
 }

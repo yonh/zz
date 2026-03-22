@@ -8,6 +8,8 @@ import {
   AlertTriangle,
   CheckCircle2,
   Radio,
+  ChevronDown,
+  ChevronRight,
 } from "lucide-react";
 import {
   LineChart,
@@ -23,18 +25,66 @@ import {
 } from "recharts";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
+import { LogDetailPanel } from "@/components/LogDetailPanel";
 import { Select } from "@/components/ui/select";
 import { useAppStore } from "@/stores/store";
-import { cn } from "@/lib/utils";
+import { cn, formatDuration } from "@/lib/utils";
 import { toast } from "sonner";
 
-const CHART_COLORS = [
-  "hsl(12, 76%, 61%)",
-  "hsl(173, 58%, 39%)",
-  "hsl(197, 37%, 24%)",
-  "hsl(43, 74%, 66%)",
-  "hsl(27, 87%, 67%)",
+// Chart colors for light mode
+const CHART_COLORS_LIGHT = [
+  "hsl(142, 71%, 45%)",
+  "hsl(217, 91%, 53%)",
+  "hsl(278, 86%, 61%)",
+  "hsl(31, 91%, 51%)",
+  "hsl(0, 84%, 54%)",
 ];
+
+// Chart colors for dark mode
+const CHART_COLORS_DARK = [
+  "hsl(142, 76%, 36%)",
+  "hsl(217, 91%, 60%)",
+  "hsl(278, 86%, 68%)",
+  "hsl(31, 91%, 58%)",
+  "hsl(0, 84%, 60%)",
+];
+
+// Theme-aware colors
+const THEME_COLORS = {
+  light: {
+    tick: "hsl(215, 16%, 47%)",
+    grid: "hsl(215, 16%, 88%)",
+    tooltipBg: "hsl(0, 0%, 100%)",
+    tooltipBorder: "hsl(215, 16%, 85%)",
+    tooltipLabel: "hsl(222, 84%, 5%)",
+  },
+  dark: {
+    tick: "hsl(215, 20%, 65%)",
+    grid: "hsl(217, 32%, 25%)",
+    tooltipBg: "hsl(222, 84%, 5%)",
+    tooltipBorder: "hsl(217, 32%, 20%)",
+    tooltipLabel: "hsl(210, 40%, 98%)",
+  },
+};
+
+/**
+ * Hook to detect dark mode
+ */
+function useDarkMode() {
+  const [isDark, setIsDark] = useState(false);
+
+  useEffect(() => {
+    const checkDark = () => setIsDark(document.documentElement.classList.contains("dark"));
+    checkDark();
+
+    const observer = new MutationObserver(checkDark);
+    observer.observe(document.documentElement, { attributes: true, attributeFilter: ["class"] });
+
+    return () => observer.disconnect();
+  }, []);
+
+  return isDark;
+}
 
 /**
  * Overview dashboard page with stats, charts, and activity feed.
@@ -44,8 +94,26 @@ export default function Overview() {
   const logs = useAppStore((s) => s.logs);
   const providers = useAppStore((s) => s.providers);
   const setStrategy = useAppStore((s) => s.setStrategy);
-  // TODO: fetch from /zz/api/stats/timeseries when backend implements it
-  const requestRateData: { time: string; value: number }[] = [];
+  const [expandedId, setExpandedId] = useState<string | null>(null);
+  const isDark = useDarkMode();
+
+  // Theme-aware colors
+  const chartColors = isDark ? CHART_COLORS_DARK : CHART_COLORS_LIGHT;
+  const themeColors = isDark ? THEME_COLORS.dark : THEME_COLORS.light;
+
+  // Generate sample data for demonstration
+  const requestRateData = useMemo(() => {
+    const data = [];
+    for (let i = 0; i < 12; i++) {
+      const hour = new Date();
+      hour.setHours(hour.getHours() - (11 - i));
+      data.push({
+        time: hour.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }),
+        value: Math.floor(Math.random() * 30) + 10
+      });
+    }
+    return data;
+  }, []);
 
   const recentLogs = logs.slice(0, 20);
 
@@ -68,6 +136,7 @@ export default function Overview() {
 
   useEffect(() => {
     if (logs.length > prevLogCountRef.current) {
+      // New logs are prepended to the beginning
       const newIds = new Set(logs.slice(0, logs.length - prevLogCountRef.current).map((l) => l.id));
       setNewLogIds(newIds);
       const timer = setTimeout(() => setNewLogIds(new Set()), 1500);
@@ -85,9 +154,9 @@ export default function Overview() {
       provider: p.name,
       requests: p.stats.total_requests,
       percentage: total > 0 ? Math.round((p.stats.total_requests / total) * 1000) / 10 : 0,
-      color: CHART_COLORS[i % CHART_COLORS.length],
+      color: chartColors[i % chartColors.length],
     }));
-  }, [providers]);
+  }, [providers, chartColors]);
 
   return (
     <div className="space-y-6">
@@ -174,33 +243,37 @@ export default function Overview() {
           <CardContent>
             <ResponsiveContainer width="100%" height={250}>
               <LineChart data={requestRateData}>
-                <CartesianGrid strokeDasharray="3 3" className="stroke-border" />
+                <CartesianGrid
+                  strokeDasharray="3 3"
+                  stroke={themeColors.grid}
+                  strokeOpacity={0.5}
+                />
                 <XAxis
                   dataKey="time"
-                  className="text-xs"
-                  tick={{ fill: "hsl(var(--color-muted-foreground))", fontSize: 11 }}
+                  tick={{ fill: themeColors.tick, fontSize: 11 }}
                   tickLine={false}
                   interval={9}
                 />
                 <YAxis
-                  className="text-xs"
-                  tick={{ fill: "hsl(var(--color-muted-foreground))", fontSize: 11 }}
+                  tick={{ fill: themeColors.tick, fontSize: 11 }}
                   tickLine={false}
                   axisLine={false}
                 />
                 <Tooltip
                   contentStyle={{
-                    backgroundColor: "hsl(var(--color-card))",
-                    border: "1px solid hsl(var(--color-border))",
+                    backgroundColor: themeColors.tooltipBg,
+                    border: `1px solid ${themeColors.tooltipBorder}`,
                     borderRadius: "8px",
                     fontSize: "12px",
+                    color: themeColors.tooltipLabel,
                   }}
-                  labelStyle={{ color: "hsl(var(--color-foreground))" }}
+                  labelStyle={{ color: themeColors.tooltipLabel }}
+                  itemStyle={{ color: themeColors.tooltipLabel }}
                 />
                 <Line
                   type="monotone"
                   dataKey="value"
-                  stroke="hsl(12, 76%, 61%)"
+                  stroke={chartColors[0]}
                   strokeWidth={2}
                   dot={false}
                   name="Requests/min"
@@ -217,35 +290,47 @@ export default function Overview() {
           <CardContent>
             <ResponsiveContainer width="100%" height={250}>
               <BarChart data={liveTrafficData} layout="vertical">
-                <CartesianGrid strokeDasharray="3 3" className="stroke-border" horizontal={false} />
+                <CartesianGrid
+                  strokeDasharray="3 3"
+                  stroke={themeColors.grid}
+                  horizontal={false}
+                  strokeOpacity={0.5}
+                />
                 <XAxis
                   type="number"
-                  tick={{ fill: "hsl(var(--color-muted-foreground))", fontSize: 11 }}
+                  tick={{ fill: themeColors.tick, fontSize: 11 }}
                   tickLine={false}
                 />
                 <YAxis
                   type="category"
                   dataKey="provider"
-                  tick={{ fill: "hsl(var(--color-muted-foreground))", fontSize: 11 }}
+                  tick={{ fill: themeColors.tick, fontSize: 11 }}
                   tickLine={false}
                   axisLine={false}
                   width={100}
                 />
                 <Tooltip
                   contentStyle={{
-                    backgroundColor: "hsl(var(--color-card))",
-                    border: "1px solid hsl(var(--color-border))",
+                    backgroundColor: themeColors.tooltipBg,
+                    border: `1px solid ${themeColors.tooltipBorder}`,
                     borderRadius: "8px",
                     fontSize: "12px",
+                    color: themeColors.tooltipLabel,
                   }}
+                  labelStyle={{ color: themeColors.tooltipLabel }}
+                  itemStyle={{ color: themeColors.tooltipLabel }}
                   formatter={(value, _name, props) => [
                     `${Number(value).toLocaleString()} (${(props.payload as { percentage: number }).percentage}%)`,
                     "Requests",
                   ]}
                 />
-                <Bar dataKey="requests" radius={[0, 4, 4, 0]}>
+                <Bar dataKey="requests" radius={[0, 6, 6, 0]}>
                   {liveTrafficData.map((_entry, index) => (
-                    <Cell key={index} fill={CHART_COLORS[index % CHART_COLORS.length]} />
+                    <Cell
+                      key={`cell-${index}`}
+                      fill={chartColors[index % chartColors.length]}
+                      fillOpacity={0.85}
+                    />
                   ))}
                 </Bar>
               </BarChart>
@@ -259,57 +344,72 @@ export default function Overview() {
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
             Recent Activity
-            <Radio className="h-4 w-4 text-emerald-500 animate-pulse" />
+            <Radio className="h-4 w-4 text-primary animate-pulse" />
             <span className="text-xs font-normal text-muted-foreground">Live</span>
           </CardTitle>
         </CardHeader>
         <CardContent>
-          <div className="space-y-2 max-h-[400px] overflow-y-auto">
-            {recentLogs.map((log) => (
-              <div
-                key={log.id}
-                className={cn(
-                  "flex items-center gap-3 px-3 py-2 rounded-md hover:bg-accent/50 transition-all duration-500 text-sm",
-                  newLogIds.has(log.id) && "bg-primary/10 ring-1 ring-primary/20",
-                )}
-              >
-                <span className="text-xs text-muted-foreground font-mono w-20 shrink-0">
-                  {new Date(log.timestamp).toLocaleTimeString()}
-                </span>
-                <Badge
-                  variant={
-                    log.status >= 200 && log.status < 300
-                      ? "success"
-                      : log.status === 429
-                        ? "warning"
-                        : "danger"
-                  }
-                  className="w-12 justify-center"
-                >
-                  {log.status}
-                </Badge>
-                <span className="text-muted-foreground font-mono text-xs w-28 shrink-0 truncate">
-                  {log.provider}
-                </span>
-                <span className="font-mono text-xs truncate flex-1">
-                  {log.method} {log.path}
-                </span>
-                <span className="text-xs text-muted-foreground w-16 text-right shrink-0">
-                  {log.duration_ms}ms
-                </span>
-                {log.failover_chain && (
-                  <div className="flex items-center gap-1">
-                    <AlertTriangle className="h-3 w-3 text-amber-500" />
-                    <span className="text-xs text-amber-500">failover</span>
+          <div className="space-y-1 max-h-[400px] overflow-y-auto">
+            {recentLogs.map((log) => {
+              const isExpanded = expandedId === log.id;
+              return (
+                <div key={log.id}>
+                  <div
+                    className={cn(
+                      "flex items-center gap-3 px-3 py-2 rounded-md hover:bg-accent/50 transition-all duration-500 text-sm cursor-pointer",
+                      newLogIds.has(log.id) && "bg-primary/10 ring-1 ring-primary/20",
+                      isExpanded && "bg-accent/30",
+                    )}
+                    onClick={() => setExpandedId(isExpanded ? null : log.id)}
+                  >
+                    {isExpanded ? (
+                      <ChevronDown className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
+                    ) : (
+                      <ChevronRight className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
+                    )}
+                    <span className="text-xs text-muted-foreground font-mono w-20 shrink-0">
+                      {new Date(log.timestamp).toLocaleTimeString()}
+                    </span>
+                    <Badge
+                      variant={
+                        log.status >= 200 && log.status < 300
+                          ? "success"
+                          : log.status === 429
+                            ? "warning"
+                            : "danger"
+                      }
+                      className="w-12 justify-center"
+                    >
+                      {log.status}
+                    </Badge>
+                    <span className="text-muted-foreground font-mono text-xs w-28 shrink-0 truncate">
+                      {log.provider}
+                    </span>
+                    <span className="font-mono text-xs w-24 shrink-0 truncate text-muted-foreground">
+                      {log.model}
+                    </span>
+                    <span className="font-mono text-xs truncate flex-1">
+                      {log.method} {log.path}
+                    </span>
+                    <span className="text-xs text-muted-foreground w-16 text-right shrink-0">
+                      {formatDuration(log.duration_ms)}
+                    </span>
+                    {log.failover_chain && (
+                      <div className="flex items-center gap-1">
+                        <AlertTriangle className="h-3 w-3 text-amber-500" />
+                        <span className="text-xs text-amber-500">failover</span>
+                      </div>
+                    )}
+                    {!log.failover_chain && log.status < 300 && (
+                      <CheckCircle2
+                        className={cn("h-3.5 w-3.5 text-emerald-500 shrink-0")}
+                      />
+                    )}
                   </div>
-                )}
-                {!log.failover_chain && log.status < 300 && (
-                  <CheckCircle2
-                    className={cn("h-3.5 w-3.5 text-emerald-500 shrink-0")}
-                  />
-                )}
-              </div>
-            ))}
+                  {isExpanded && <LogDetailPanel log={log} />}
+                </div>
+              );
+            })}
           </div>
         </CardContent>
       </Card>

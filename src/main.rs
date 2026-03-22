@@ -66,7 +66,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let log_buffer = Arc::new(stats::RequestLogBuffer::new(10000));
     let ws_broadcaster = Arc::new(ws::WsBroadcaster::new());
     let rpm_counter = Arc::new(stats::RpmCounter::new());
-    let model_rules = Arc::new(std::sync::RwLock::new(Vec::<router::ModelRule>::new()));
+    let model_rules = Arc::new(std::sync::RwLock::new(
+        cfg.routing.rules.iter().enumerate().map(|(i, r)| router::ModelRule {
+            id: format!("rule_{}", i + 1),
+            pattern: r.pattern.clone(),
+            target_provider: r.target_provider.clone(),
+        }).collect::<Vec<_>>()
+    ));
     let start_time = Instant::now();
 
     let state = proxy::AppState {

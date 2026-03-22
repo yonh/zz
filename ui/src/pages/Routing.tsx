@@ -35,7 +35,13 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Select } from "@/components/ui/select";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { useAppStore } from "@/stores/store";
 import type { RoutingStrategy, Provider } from "@/api/types";
 import { cn } from "@/lib/utils";
@@ -353,12 +359,18 @@ function ManualSettings() {
       <div className="flex items-end gap-4">
         <div className="space-y-2 flex-1 max-w-xs">
           <label className="text-sm font-medium">Pinned Provider</label>
-          <Select
-            value={selected}
-            onChange={(e) => setSelected(e.target.value)}
-            options={providers.map((p) => ({ value: p.name, label: p.name }))}
-            className="h-9"
-          />
+          <Select value={selected} onValueChange={setSelected}>
+            <SelectTrigger className="h-9">
+              <SelectValue placeholder="Select provider..." />
+            </SelectTrigger>
+            <SelectContent>
+              {providers.map((p) => (
+                <SelectItem key={p.name} value={p.name}>
+                  {p.name}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
         </div>
         <Button onClick={handlePin} className="gap-2">
           <Pin className="h-4 w-4" /> Pin Provider
@@ -657,15 +669,18 @@ export default function Routing() {
             </div>
             <div className="space-y-1 flex-1">
               <label className="text-xs font-medium">Target Provider</label>
-              <Select
-                value={newRuleTarget}
-                onChange={(e) => setNewRuleTarget(e.target.value)}
-                className="h-9"
-                options={[
-                  { value: "", label: "Select provider..." },
-                  ...enabledProviders.map((p) => ({ value: p.name, label: p.name })),
-                ]}
-              />
+              <Select value={newRuleTarget} onValueChange={setNewRuleTarget}>
+                <SelectTrigger className="h-9">
+                  <SelectValue placeholder="Select provider..." />
+                </SelectTrigger>
+                <SelectContent>
+                  {enabledProviders.map((p) => (
+                    <SelectItem key={p.name} value={p.name}>
+                      {p.name}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
             </div>
             <Button
               onClick={handleAddRule}

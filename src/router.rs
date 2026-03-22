@@ -111,6 +111,11 @@ impl Router {
     }
 }
 
+/// Simple glob pattern matching (exported for use in proxy)
+pub fn glob_match_pub(pattern: &str, text: &str) -> bool {
+    glob_match(pattern, text)
+}
+
 /// Simple glob pattern matching
 fn glob_match(pattern: &str, text: &str) -> bool {
     let pattern_chars: Vec<char> = pattern.chars().collect();
