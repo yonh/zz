@@ -25,7 +25,6 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Select } from "@/components/ui/select";
 import { useAppStore } from "@/stores/store";
-import { generateRequestRateData } from "@/api/mock";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
 
@@ -45,7 +44,8 @@ export default function Overview() {
   const logs = useAppStore((s) => s.logs);
   const providers = useAppStore((s) => s.providers);
   const setStrategy = useAppStore((s) => s.setStrategy);
-  const requestRateData = useMemo(() => generateRequestRateData(), []);
+  // TODO: fetch from /zz/api/stats/timeseries when backend implements it
+  const requestRateData: { time: string; value: number }[] = [];
 
   const recentLogs = logs.slice(0, 20);
 

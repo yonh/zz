@@ -150,7 +150,9 @@ Critical for LLM APIs. The proxy must:
 
 ## API Endpoints
 
-The proxy exposes:
+The proxy exposes admin endpoints prefixed with `/zz/` to avoid collision with upstream API paths.
+
+### Legacy Endpoints (CLI/curl)
 
 | Endpoint | Description |
 |----------|-------------|
@@ -159,23 +161,64 @@ The proxy exposes:
 | `GET /zz/stats` | Request/error counts per provider |
 | `POST /zz/reload` | Hot-reload config without restart |
 
-Admin endpoints are prefixed with `/zz/` to avoid collision with upstream API paths.
+### Admin REST API (Web Dashboard)
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /zz/api/providers` | List all providers with config, state, and stats |
+| `POST /zz/api/providers` | Add a new provider at runtime |
+| `GET /zz/api/providers/{name}` | Get single provider details |
+| `PUT /zz/api/providers/{name}` | Update provider config |
+| `DELETE /zz/api/providers/{name}` | Remove provider |
+| `POST /zz/api/providers/{name}/test` | Test provider connectivity |
+| `POST /zz/api/providers/{name}/enable` | Enable provider |
+| `POST /zz/api/providers/{name}/disable` | Disable provider |
+| `POST /zz/api/providers/{name}/reset` | Reset health/cooldown state |
+| `GET /zz/api/routing` | Get routing config + model rules |
+| `PUT /zz/api/routing` | Update routing strategy/parameters |
+| `GET /zz/api/routing/rules` | Get model routing rules |
+| `PUT /zz/api/routing/rules` | Replace model routing rules |
+| `GET /zz/api/stats` | Aggregated system stats (JSON) |
+| `GET /zz/api/stats/timeseries` | Time-series data for charts |
+| `GET /zz/api/logs` | Paginated structured request logs |
+| `GET /zz/api/config` | Get config TOML content + metadata |
+| `PUT /zz/api/config` | Validate + save + hot-reload config |
+| `POST /zz/api/config/validate` | Validate config without saving |
+| `GET /zz/api/health` | Proxy health check |
+| `GET /zz/api/version` | Version info |
+
+### WebSocket
+
+| Endpoint | Description |
+|----------|-------------|
+| `WS /zz/ws` | Real-time push: logs, provider state changes, stats snapshots (every 5s) |
+
+### Static Files (Production)
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /zz/ui/*` | Embedded web dashboard static files |
+
+> See `SPEC-API.md` for full request/response schemas and WebSocket protocol details.
 
 ## Module Structure
 
 ```
 src/
-├── main.rs              # Entry point, CLI args, server startup
+├── main.rs              # Entry point, CLI args, server startup, background tasks
 ├── config.rs            # Config parsing (TOML) and validation
-├── proxy.rs             # Core proxy handler (request/response forwarding)
-├── router.rs            # Provider selection logic (failover/round-robin/weighted)
-├── provider.rs          # Provider state management (health, cooldown, counters)
+├── proxy.rs             # Core proxy handler (request/response forwarding, log collection)
+├── router.rs            # Provider selection logic (failover/round-robin/weighted/quota-aware/manual)
+├── provider.rs          # Provider state management (health, cooldown, counters, latency tracking)
 ├── rewriter.rs          # URL and header rewriting
-├── health.rs            # Health check and recovery logic
 ├── stream.rs            # SSE/chunked streaming utilities
-├── admin.rs             # /zz/* admin endpoints
+├── admin.rs             # Legacy /zz/* admin endpoints (health, stats, reload)
+├── admin_api.rs         # /zz/api/* REST endpoints for web dashboard
+├── ws.rs                # WebSocket handler + broadcast channel
+├── cors.rs              # CORS middleware for /zz/* endpoints
+├── stats.rs             # RPM counter, time-series aggregation
 ├── error.rs             # Error types
-└── logging.rs           # Structured logging setup
+└── logging.rs           # Structured logging setup + RequestLogBuffer
 ```
 
 ## Dependencies
@@ -192,21 +235,19 @@ src/
 
 ## Non-Goals (V1)
 
-- **No request body parsing**: We don't inspect or modify request/response content
+- **No request body modification**: Request/response bodies are streamed through without modification (model field is read-only parsed for logging)
 - **No authentication on proxy**: Proxy is local-only (127.0.0.1), no auth needed
-- **No TLS termination**: Upstream uses HTTPS via `hyper-tls` or `rustls`, but proxy listens on plain HTTP
+- **No TLS termination**: Upstream uses HTTPS via `rustls`, but proxy listens on plain HTTP
 - **No caching**: Every request is forwarded
 - **No model mapping**: Provider must support the model name the client sends as-is
-- **No token counting**: Quota detection is based on HTTP errors, not token usage tracking
 
 ## Future Considerations (V2+)
 
-- **Token budget tracking**: Parse usage from response to proactively switch before hitting limit
+- **Token budget tracking**: Parse `usage` from response to proactively switch before hitting limit (quota-aware strategy)
 - **Model aliasing**: Map model names between providers (e.g., `gpt-4` → `qwen-plus`)
-- **Web dashboard**: Real-time stats and provider management UI
 - **Config encryption**: Encrypt API keys at rest
 - **Multi-protocol**: Native Anthropic API support (non-OpenAI format)
-- **Request logging**: Optional request/response logging for debugging
+- **Request/response body logging**: Optional full body capture for debugging
 
 ## Success Criteria
 

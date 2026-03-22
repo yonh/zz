@@ -8,14 +8,28 @@ import type {
   RoutingStrategy,
   ProviderStatus,
 } from "@/api/types";
-import {
-  mockProviders,
-  mockSystemStats,
-  generateMockLogs,
-  mockRoutingConfig,
-  mockModelRules,
-  mockConfigToml,
-} from "@/api/mock";
+import { api } from "@/api/client";
+
+/**
+ * Empty default values for initial state before API data loads.
+ */
+const defaultSystemStats: SystemStats = {
+  total_requests: 0,
+  requests_per_minute: 0,
+  active_providers: 0,
+  healthy_providers: 0,
+  total_providers: 0,
+  strategy: "failover",
+  uptime_secs: 0,
+};
+
+const defaultRoutingConfig: RoutingConfig = {
+  strategy: "failover",
+  max_retries: 3,
+  cooldown_secs: 60,
+  failure_threshold: 3,
+  recovery_secs: 600,
+};
 
 /**
  * Read persisted dark mode preference from localStorage.
@@ -39,6 +53,8 @@ interface AppState {
   modelRules: ModelRule[];
   configToml: string;
   darkMode: boolean;
+  loading: boolean;
+  error: string | null;
 
   setStrategy: (strategy: RoutingStrategy) => void;
   toggleProvider: (name: string) => void;
@@ -57,16 +73,21 @@ interface AppState {
   updateProvider: (name: string, updates: Partial<Provider>) => void;
   addProvider: (provider: Provider) => void;
   removeProvider: (name: string) => void;
+  setSystemStats: (stats: SystemStats) => void;
+  setLogs: (logs: LogEntry[]) => void;
+  initFromApi: () => Promise<void>;
 }
 
 export const useAppStore = create<AppState>((set) => ({
-  providers: mockProviders,
-  systemStats: mockSystemStats,
-  logs: generateMockLogs(50),
-  routingConfig: mockRoutingConfig,
-  modelRules: mockModelRules,
-  configToml: mockConfigToml,
+  providers: [],
+  systemStats: defaultSystemStats,
+  logs: [],
+  routingConfig: defaultRoutingConfig,
+  modelRules: [],
+  configToml: "",
   darkMode: getInitialDarkMode(),
+  loading: true,
+  error: null,
 
   setStrategy: (strategy) =>
     set((state) => ({
@@ -227,4 +248,35 @@ export const useAppStore = create<AppState>((set) => ({
           : state.systemStats.active_providers,
       },
     })),
+
+  setSystemStats: (stats) => set({ systemStats: stats }),
+
+  setLogs: (logs) => set({ logs }),
+
+  initFromApi: async () => {
+    set({ loading: true, error: null });
+    try {
+      const [providersRes, stats, routing, rulesRes, configRes, logsRes] = await Promise.all([
+        api.getProviders(),
+        api.getStats(),
+        api.getRouting(),
+        api.getRules(),
+        api.getConfig(),
+        api.getLogs(0, 100),
+      ]);
+      set({
+        providers: providersRes.providers,
+        systemStats: stats,
+        routingConfig: routing,
+        modelRules: rulesRes.rules,
+        configToml: configRes.content,
+        logs: logsRes.logs,
+        loading: false,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Failed to connect to backend";
+      console.error("Failed to initialize from API:", err);
+      set({ loading: false, error: message });
+    }
+  },
 }));

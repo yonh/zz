@@ -11,4 +11,16 @@ export default defineConfig({
       "@": path.resolve(__dirname, "./src"),
     },
   },
+  server: {
+    proxy: {
+      "/zz/api": {
+        target: "http://127.0.0.1:9090",
+        changeOrigin: true,
+      },
+      "/zz/ws": {
+        target: "ws://127.0.0.1:9090",
+        ws: true,
+      },
+    },
+  },
 })

@@ -2,9 +2,16 @@ pub struct RequestRewriter;
 
 impl RequestRewriter {
     pub fn rewrite_url(base_url: &str, path: &str) -> Result<String, anyhow::Error> {
-        let url = url::Url::parse(base_url)?;
+        // Ensure base_url has trailing slash so url::Url::join doesn't strip
+        // the last path segment. e.g. "https://host/apps/anthropic" + "/v1/messages"
+        // would otherwise produce "https://host/apps/v1/messages".
+        let base = if base_url.ends_with('/') {
+            base_url.to_string()
+        } else {
+            format!("{}/", base_url)
+        };
+        let url = url::Url::parse(&base)?;
         let joined = url.join(path.trim_start_matches('/'))?;
-        // Preserve query and fragment from original if needed
         Ok(joined.to_string())
     }
 

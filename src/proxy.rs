@@ -30,6 +30,17 @@ pub async fn proxy_handler(
         .map_err(|e| crate::error::ProxyError::RequestError(e.to_string()))?
         .to_bytes();
 
+    // Tracking variables for logging
+    let request_id = generate_request_id();
+    let proxy_start = std::time::Instant::now();
+    let request_bytes = body_bytes.len() as u64;
+    let model = extract_model(&body_bytes);
+    let mut failover_chain: Vec<String> = Vec::new();
+    let mut final_provider = String::new();
+    let mut final_status: u16 = 503;
+    let mut response_bytes: u64 = 0;
+    let mut ttfb_ms: u64 = 0;
+
     let max_retries = {
         let config = state.config.read().unwrap();
         config.routing.max_retries
@@ -83,8 +94,46 @@ pub async fn proxy_handler(
             is_sse,
             request_timeout_secs,
         ).await {
-            Ok(response) => return Ok(response),
+            Ok((response, resp_bytes, resp_ttfb_ms)) => {
+                let status_code = response.status().as_u16();
+                failover_chain.push(format!("{}:{}", provider_name, status_code));
+                final_provider = provider_name.clone();
+                final_status = status_code;
+                response_bytes = resp_bytes;
+                ttfb_ms = resp_ttfb_ms;
+
+                // Record latency
+                let latency_ms = proxy_start.elapsed().as_millis() as u64;
+                provider.record_latency(latency_ms);
+
+                // Build and store log entry
+                let log_entry = crate::stats::LogEntry {
+                    id: request_id.clone(),
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                    method: method.to_string(),
+                    path: path.clone(),
+                    provider: final_provider.clone(),
+                    status: final_status,
+                    duration_ms: latency_ms,
+                    ttfb_ms,
+                    model: model.clone(),
+                    streaming: is_sse,
+                    request_bytes,
+                    response_bytes,
+                    failover_chain: if failover_chain.len() > 1 {
+                        Some(failover_chain.clone())
+                    } else {
+                        None
+                    },
+                };
+                state.log_buffer.push(log_entry.clone());
+                state.rpm_counter.increment();
+                state.ws_broadcaster.broadcast_log(log_entry);
+
+                return Ok(response);
+            }
             Err(e) => {
+                failover_chain.push(format!("{}:err", provider_name));
                 tracing::warn!(
                     provider = %provider_name,
                     error = %e,
@@ -99,6 +148,26 @@ pub async fn proxy_handler(
     let error_msg = last_error
         .map(|e| format!("All providers failed. Last error: {}", e))
         .unwrap_or_else(|| "No available providers".to_string());
+
+    // Log failed request
+    let log_entry = crate::stats::LogEntry {
+        id: request_id,
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        method: method.to_string(),
+        path: path.clone(),
+        provider: final_provider,
+        status: 503,
+        duration_ms: proxy_start.elapsed().as_millis() as u64,
+        ttfb_ms: 0,
+        model,
+        streaming: is_sse,
+        request_bytes,
+        response_bytes: 0,
+        failover_chain: if failover_chain.len() > 1 { Some(failover_chain) } else { None },
+    };
+    state.log_buffer.push(log_entry.clone());
+    state.rpm_counter.increment();
+    state.ws_broadcaster.broadcast_log(log_entry);
 
     Ok(hyper::Response::builder()
         .status(hyper::StatusCode::SERVICE_UNAVAILABLE)
@@ -120,7 +189,8 @@ async fn attempt_request(
     state: &AppState,
     is_sse: bool,
     request_timeout_secs: u64,
-) -> Result<hyper::Response<ResponseBody>, crate::error::ProxyError> {
+) -> Result<(hyper::Response<ResponseBody>, u64, u64), crate::error::ProxyError> {
+    // Returns: (response, response_bytes, ttfb_ms)
     // Rewrite URL
     let upstream_url = crate::rewriter::RequestRewriter::rewrite_url(
         &provider.config.base_url,
@@ -166,7 +236,7 @@ async fn attempt_request(
     // Send request to upstream with timeout
     tracing::debug!(url = %upstream_url, is_sse = is_sse, "Sending request to upstream");
 
-    let start = std::time::Instant::now();
+    let ttfb_start = std::time::Instant::now();
     let response = tokio::time::timeout(
         timeout,
         client.request(upstream_req)
@@ -174,7 +244,8 @@ async fn attempt_request(
         .map_err(|_| crate::error::ProxyError::RequestError("Request timeout".to_string()))?
         .map_err(|e| crate::error::ProxyError::HttpError(e.to_string()))?;
 
-    let elapsed = start.elapsed();
+    let ttfb_ms = ttfb_start.elapsed().as_millis() as u64;
+    let elapsed = ttfb_start.elapsed();
 
     let status = response.status();
     let response_headers = response.headers().clone();
@@ -213,9 +284,10 @@ async fn attempt_request(
             downstream_response = downstream_response.header(name, value);
         }
 
-        return Ok(downstream_response
+        let resp_bytes = response_bytes.len() as u64;
+        return Ok((downstream_response
             .body(full(response_bytes))
-            .unwrap());
+            .unwrap(), resp_bytes, ttfb_ms));
     }
 
     // Success response
@@ -243,23 +315,26 @@ async fn attempt_request(
             downstream_response = downstream_response.header(name, value);
         }
 
-        Ok(downstream_response
+        // response_bytes unknown for streaming
+        Ok((downstream_response
             .body(body)
-            .unwrap())
+            .unwrap(), 0, ttfb_ms))
     } else {
         // Buffer response for non-SSE
-        let response_bytes = response.collect().await
+        let resp_bytes = response.collect().await
             .map_err(|e| crate::error::ProxyError::HttpError(e.to_string()))?
             .to_bytes();
+
+        let response_bytes_val = resp_bytes.len() as u64;
 
         let mut downstream_response = hyper::Response::builder().status(status);
         for (name, value) in response_headers.iter() {
             downstream_response = downstream_response.header(name, value);
         }
 
-        Ok(downstream_response
-            .body(full(response_bytes))
-            .unwrap())
+        Ok((downstream_response
+            .body(full(resp_bytes))
+            .unwrap(), response_bytes_val, ttfb_ms))
     }
 }
 
@@ -269,6 +344,11 @@ pub struct AppState {
     pub router: Arc<crate::router::Router>,
     pub config: Arc<std::sync::RwLock<crate::config::Config>>,
     pub config_path: String,
+    pub start_time: std::time::Instant,
+    pub log_buffer: Arc<crate::stats::RequestLogBuffer>,
+    pub ws_broadcaster: Arc<crate::ws::WsBroadcaster>,
+    pub model_rules: Arc<std::sync::RwLock<Vec<crate::router::ModelRule>>>,
+    pub rpm_counter: Arc<crate::stats::RpmCounter>,
 }
 
 impl AppState {
@@ -288,4 +368,30 @@ impl AppState {
         tracing::info!("Config reloaded successfully");
         Ok(())
     }
+}
+
+/// Best-effort extract "model" field from request body JSON (check first 2KB).
+fn extract_model(body: &[u8]) -> String {
+    let check_len = body.len().min(2048);
+    if let Ok(s) = std::str::from_utf8(&body[..check_len]) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(s) {
+            if let Some(m) = v.get("model").and_then(|m| m.as_str()) {
+                return m.to_string();
+            }
+        }
+    }
+    "unknown".to_string()
+}
+
+/// Generate a short random request ID.
+fn generate_request_id() -> String {
+    use rand::RngExt;
+    let mut rng = rand::rng();
+    let id: String = (0..12)
+        .map(|_| {
+            let idx = rng.random_range(0..36u8);
+            if idx < 10 { (b'0' + idx) as char } else { (b'a' + idx - 10) as char }
+        })
+        .collect();
+    format!("req_{}", id)
 }

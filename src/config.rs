@@ -27,6 +27,8 @@ pub struct RoutingConfig {
     pub retry_on_failure: bool,
     #[serde(default = "default_max_retries")]
     pub max_retries: usize,
+    #[serde(default)]
+    pub pinned_provider: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -52,6 +54,8 @@ pub struct ProviderConfig {
     pub models: Vec<String>,
     #[serde(default)]
     pub headers: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    pub token_budget: Option<u64>,
 }
 
 fn default_listen() -> String {
@@ -93,7 +97,11 @@ fn default_cooldown_secs() -> u64 {
 impl Config {
     pub fn load(path: &str) -> Result<Self, anyhow::Error> {
         let contents = std::fs::read_to_string(path)?;
-        let config: Config = toml::from_str(&contents)?;
+        Self::load_from_str(&contents)
+    }
+
+    pub fn load_from_str(contents: &str) -> Result<Self, anyhow::Error> {
+        let config: Config = toml::from_str(contents)?;
 
         // Validate required fields
         for provider in &config.provider_configs {
