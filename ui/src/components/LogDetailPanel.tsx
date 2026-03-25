@@ -64,11 +64,45 @@ export function LogDetailPanel({ log }: { log: LogEntry }) {
       {log.token_usage && (
         <div className="border-t pt-3 mt-2">
           <span className="text-muted-foreground font-medium">Token Usage</span>
-          <div className="mt-2 bg-muted/50 rounded-md p-3 overflow-x-auto">
-            <pre className="font-mono text-[11px] text-foreground/90 whitespace-pre-wrap break-all">
-              {JSON.stringify(log.token_usage, null, 2)}
-            </pre>
+          <div className="mt-2 grid grid-cols-3 gap-4">
+            <div className="bg-muted/50 rounded-md p-2">
+              <div className="text-muted-foreground text-[10px] mb-1">Prompt Tokens</div>
+              <div className="font-mono text-sm font-medium">
+                {log.token_usage.prompt_tokens.toLocaleString()}
+              </div>
+            </div>
+            <div className="bg-muted/50 rounded-md p-2">
+              <div className="text-muted-foreground text-[10px] mb-1">Completion Tokens</div>
+              <div className="font-mono text-sm font-medium">
+                {log.token_usage.completion_tokens.toLocaleString()}
+              </div>
+            </div>
+            <div className="bg-muted/50 rounded-md p-2">
+              <div className="text-muted-foreground text-[10px] mb-1">Total Tokens</div>
+              <div className="font-mono text-sm font-medium">
+                {log.token_usage.total_tokens.toLocaleString()}
+              </div>
+            </div>
           </div>
+          {log.token_usage.details && Object.keys(log.token_usage.details).length > 0 && (
+            <div className="mt-2 bg-muted/50 rounded-md p-2">
+              <div className="text-muted-foreground text-[10px] mb-1">Additional Details</div>
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+                {Object.entries(log.token_usage.details).map(([key, value]) => (
+                  value !== undefined && (
+                    <div key={key}>
+                      <div className="text-muted-foreground text-[10px]">
+                        {key.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase())}
+                      </div>
+                      <div className="font-mono text-xs mt-0.5">
+                        {value.toLocaleString()}
+                      </div>
+                    </div>
+                  )
+                ))}
+              </div>
+            </div>
+          )}
         </div>
       )}
     </div>

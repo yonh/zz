@@ -288,7 +288,18 @@ export const useAppStore = create<AppState>((set) => ({
       },
     })),
 
-  setSystemStats: (stats) => set({ systemStats: stats }),
+  setSystemStats: (stats) => set((state) => ({
+    systemStats: {
+      ...defaultSystemStats,
+      ...state.systemStats,
+      ...stats,
+      tokens: {
+        ...defaultSystemStats.tokens,
+        ...(state.systemStats.tokens || {}),
+        ...(stats.tokens || {}),
+      },
+    },
+  })),
 
   setLogs: (logs) => set({ logs }),
 

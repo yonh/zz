@@ -91,11 +91,16 @@ function useDarkMode() {
  */
 export default function Overview() {
   const systemStats = useAppStore((s) => s.systemStats);
+  const routingConfig = useAppStore((s) => s.routingConfig);
   const logs = useAppStore((s) => s.logs);
   const providers = useAppStore((s) => s.providers);
   const setStrategy = useAppStore((s) => s.setStrategy);
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const isDark = useDarkMode();
+
+  // Use routingConfig.strategy as the source of truth, with systemStats.strategy as fallback
+  // Use ?? instead of || to handle empty string case correctly
+  const currentStrategy = routingConfig.strategy ?? systemStats.strategy ?? "failover";
 
   // Theme-aware colors
   const chartColors = isDark ? CHART_COLORS_DARK : CHART_COLORS_LIGHT;
@@ -172,15 +177,12 @@ export default function Overview() {
             <Activity className="h-4 w-4 text-muted-foreground" />
           </CardHeader>
           <CardContent>
-            <div className="text-2xl font-bold">
-              {systemStats.total_requests.toLocaleString()}
-            </div>
+            <div className="text-2xl font-bold">{systemStats.total_requests.toLocaleString()}</div>
             <p className="text-xs text-muted-foreground">
-              {systemStats.requests_per_minute.toFixed(1)} req/min
+              {systemStats.requests_per_minute.toFixed(1)} requests/min
             </p>
           </CardContent>
         </Card>
-
         <Card>
           <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
             <CardTitle className="text-sm font-medium">Active Providers</CardTitle>
@@ -188,37 +190,35 @@ export default function Overview() {
           </CardHeader>
           <CardContent>
             <div className="text-2xl font-bold">
-              {systemStats.active_providers}/{systemStats.total_providers}
+              {systemStats.active_providers} / {systemStats.total_providers}
             </div>
             <p className="text-xs text-muted-foreground">
-              {systemStats.total_providers - systemStats.active_providers} disabled
+              {systemStats.healthy_providers} healthy
             </p>
           </CardContent>
         </Card>
-
         <Card>
           <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-            <CardTitle className="text-sm font-medium">Healthy Providers</CardTitle>
-            <ShieldCheck className="h-4 w-4 text-muted-foreground" />
+            <CardTitle className="text-sm font-medium">Token Usage</CardTitle>
+            <TrendingUp className="h-4 w-4 text-muted-foreground" />
           </CardHeader>
           <CardContent>
             <div className="text-2xl font-bold">
-              {systemStats.healthy_providers}/{systemStats.total_providers}
+              {(systemStats.tokens?.total ?? 0).toLocaleString()}
             </div>
             <p className="text-xs text-muted-foreground">
-              {systemStats.active_providers - systemStats.healthy_providers} in cooldown
+              {(systemStats.tokens?.prompt ?? 0).toLocaleString()} prompt / {(systemStats.tokens?.completion ?? 0).toLocaleString()} completion
             </p>
           </CardContent>
         </Card>
-
         <Card>
           <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-            <CardTitle className="text-sm font-medium">Strategy</CardTitle>
+            <CardTitle className="text-sm font-medium">Routing Strategy</CardTitle>
             <ArrowRightLeft className="h-4 w-4 text-muted-foreground" />
           </CardHeader>
           <CardContent>
             <Select
-              value={systemStats.strategy}
+              value={currentStrategy}
               onValueChange={handleStrategyChange}
             >
               <SelectTrigger className="h-8 text-sm">
@@ -242,31 +242,28 @@ export default function Overview() {
 
       {/* Charts Row */}
       <div className="grid gap-4 lg:grid-cols-7 shrink-0">
+        {/* Request Rate Chart */}
         <Card className="lg:col-span-4">
           <CardHeader>
-            <CardTitle className="flex items-center gap-2">
-              <TrendingUp className="h-4 w-4" />
-              Request Rate (Last 1h)
-            </CardTitle>
+            <CardTitle>Request Rate</CardTitle>
           </CardHeader>
-          <CardContent>
-            <ResponsiveContainer width="100%" height={250}>
+          <CardContent className="pr-4 pl-0">
+            <ResponsiveContainer width="100%" height={200}>
               <LineChart data={requestRateData}>
-                <CartesianGrid
-                  strokeDasharray="3 3"
-                  stroke={themeColors.grid}
-                  strokeOpacity={0.5}
-                />
+                <CartesianGrid strokeDasharray="3 3" stroke={themeColors.grid} />
                 <XAxis
                   dataKey="time"
-                  tick={{ fill: themeColors.tick, fontSize: 11 }}
-                  tickLine={false}
-                  interval={9}
-                />
-                <YAxis
-                  tick={{ fill: themeColors.tick, fontSize: 11 }}
+                  stroke={themeColors.tick}
+                  fontSize={12}
                   tickLine={false}
                   axisLine={false}
+                />
+                <YAxis
+                  stroke={themeColors.tick}
+                  fontSize={12}
+                  tickLine={false}
+                  axisLine={false}
+                  width={80}
                 />
                 <Tooltip
                   contentStyle={{
@@ -285,38 +282,39 @@ export default function Overview() {
                   stroke={chartColors[0]}
                   strokeWidth={2}
                   dot={false}
-                  name="Requests/min"
                 />
               </LineChart>
             </ResponsiveContainer>
           </CardContent>
         </Card>
 
+        {/* Live Traffic Distribution */}
         <Card className="lg:col-span-3">
           <CardHeader>
-            <CardTitle>Traffic Distribution</CardTitle>
+            <CardTitle className="flex items-center gap-2">
+              Live Traffic
+              <Radio className="h-4 w-4 text-primary animate-pulse" />
+            </CardTitle>
           </CardHeader>
-          <CardContent>
-            <ResponsiveContainer width="100%" height={250}>
+          <CardContent className="pr-4 pl-0">
+            <ResponsiveContainer width="100%" height={200}>
               <BarChart data={liveTrafficData} layout="vertical">
-                <CartesianGrid
-                  strokeDasharray="3 3"
-                  stroke={themeColors.grid}
-                  horizontal={false}
-                  strokeOpacity={0.5}
-                />
+                <CartesianGrid strokeDasharray="3 3" stroke={themeColors.grid} />
                 <XAxis
                   type="number"
-                  tick={{ fill: themeColors.tick, fontSize: 11 }}
-                  tickLine={false}
-                />
-                <YAxis
-                  type="category"
-                  dataKey="provider"
-                  tick={{ fill: themeColors.tick, fontSize: 11 }}
+                  stroke={themeColors.tick}
+                  fontSize={12}
                   tickLine={false}
                   axisLine={false}
+                />
+                <YAxis
+                  dataKey="provider"
+                  type="category"
                   width={100}
+                  stroke={themeColors.tick}
+                  fontSize={12}
+                  tickLine={false}
+                  axisLine={false}
                 />
                 <Tooltip
                   contentStyle={{

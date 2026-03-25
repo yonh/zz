@@ -33,6 +33,11 @@ function generateRandomLog(): LogEntry {
     failover_chain: isFailover
       ? [`${PROVIDERS[0]}:429`, `${PROVIDERS[1]}:200`]
       : null,
+    token_usage: isError ? undefined : {
+      prompt_tokens: Math.floor(100 + Math.random() * 2000),
+      completion_tokens: Math.floor(50 + Math.random() * 1000),
+      total_tokens: Math.floor(150 + Math.random() * 3000),
+    },
   };
 }
 

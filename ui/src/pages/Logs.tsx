@@ -22,7 +22,7 @@ import {
 } from "@/components/ui/select";
 import { useAppStore } from "@/stores/store";
 import type { LogEntry } from "@/api/types";
-import { cn } from "@/lib/utils";
+import { cn, formatDuration } from "@/lib/utils";
 import { toast } from "sonner";
 
 /**
@@ -39,7 +39,7 @@ function LogDetailPanel({ log }: { log: LogEntry }) {
         <div>
           <span className="text-muted-foreground">Duration</span>
           <div className="font-mono mt-0.5">
-            {log.duration_ms}ms (TTFB: {log.ttfb_ms}ms)
+            {formatDuration(log.duration_ms)} (TTFB: {formatDuration(log.ttfb_ms)})
           </div>
         </div>
         <div>
@@ -294,7 +294,7 @@ export default function Logs() {
                       {log.method} {log.path}
                     </span>
                     <span className="font-mono text-xs text-right text-muted-foreground">
-                      {log.duration_ms}ms
+                      {formatDuration(log.duration_ms)}
                     </span>
                     <span className="font-mono text-xs text-right text-muted-foreground">
                       {log.token_usage ? log.token_usage.total_tokens.toLocaleString() : "-"}
