@@ -64,6 +64,12 @@ pub struct ProviderConfig {
     pub headers: std::collections::HashMap<String, String>,
     #[serde(default)]
     pub token_budget: Option<u64>,
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+}
+
+fn default_enabled() -> bool {
+    true
 }
 
 fn default_listen() -> String {

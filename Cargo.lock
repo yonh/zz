@@ -2203,6 +2203,7 @@ dependencies = [
  "hyper",
  "hyper-rustls",
  "hyper-util",
+ "percent-encoding",
  "rand 0.10.0",
  "rustls-native-certs",
  "serde",

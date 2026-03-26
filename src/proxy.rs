@@ -1,3 +1,4 @@
+use dashmap::DashMap;
 use std::sync::Arc;
 use http_body_util::{BodyExt, Full, combinators::BoxBody, StreamBody};
 use hyper::body::{Bytes, Frame, Incoming};
@@ -97,29 +98,54 @@ pub async fn proxy_handler(
             break;
         }
 
-        // Select provider based on model rules first, then routing strategy
-        let (provider_name, provider) = {
-            let rules = state.model_rules.read().unwrap();
-            tracing::debug!(
-                model = %model,
-                rules_count = rules.len(),
-                "Selecting provider for model"
-            );
-            match select_with_rules(&model, &providers, &rules, &state.router) {
-                SelectResult::Provider(p) => p,
-                SelectResult::RuleMatchedButUnavailable(target) => {
-                    tracing::warn!(
-                        model = %model,
-                        target_provider = %target,
-                        "Model rule matched but target provider is unavailable, stopping retry"
-                    );
-                    break;
-                }
-                SelectResult::NoRule => {
-                    match state.router.select_provider(&providers) {
-                        Some(p) => p,
-                        None => break,
+        // Select provider: priority is model_pins > model_rules > routing_strategy
+        let (provider_name, provider, is_pinned) = {
+            // 1. Check model pinning (highest priority)
+            if let Some(pinned_provider_name) = state.model_pins.get(&model) {
+                let pinned_name = pinned_provider_name.value().clone();
+                drop(pinned_provider_name);
+                
+                match state.provider_manager.get_by_name(&pinned_name) {
+                    Some(p) if p.is_available() => {
+                        tracing::info!(
+                            model = %model,
+                            pinned_provider = %pinned_name,
+                            "Using pinned provider for model"
+                        );
+                        (pinned_name, Arc::clone(&p), true)
                     }
+                    Some(_) => {
+                        // Pinned provider exists but is unavailable (disabled/unhealthy)
+                        tracing::error!(
+                            model = %model,
+                            pinned_provider = %pinned_name,
+                            "Pinned provider is unavailable, returning 503"
+                        );
+                        return Err(crate::error::ProxyError::ProviderError(format!(
+                            "Pinned provider '{}' for model '{}' is unavailable",
+                            pinned_name, model
+                        )));
+                    }
+                    None => {
+                        // Pinned provider was deleted, clean up pin and fall through
+                        tracing::warn!(
+                            model = %model,
+                            pinned_provider = %pinned_name,
+                            "Pinned provider deleted, removing pin"
+                        );
+                        state.model_pins.remove(&model);
+                        // Fall through to normal routing
+                        match select_provider_normal(&model, &providers, &state) {
+                            Some(p) => (p.0, p.1, false),
+                            None => break,
+                        }
+                    }
+                }
+            } else {
+                // No pin, use normal routing
+                match select_provider_normal(&model, &providers, &state) {
+                    Some(p) => (p.0, p.1, false),
+                    None => break,
                 }
             }
         };
@@ -199,6 +225,17 @@ pub async fn proxy_handler(
             }
             Err(e) => {
                 failover_chain.push(format!("{}:err", provider_name));
+                
+                // If this is a pinned provider, don't retry - return error immediately
+                if is_pinned {
+                    tracing::error!(
+                        provider = %provider_name,
+                        error = %e,
+                        "Pinned provider failed, returning error without retry"
+                    );
+                    return Err(e);
+                }
+                
                 tracing::warn!(
                     provider = %provider_name,
                     error = %e,
@@ -427,6 +464,7 @@ pub struct AppState {
     pub log_buffer: Arc<crate::stats::RequestLogBuffer>,
     pub ws_broadcaster: Arc<crate::ws::WsBroadcaster>,
     pub model_rules: Arc<std::sync::RwLock<Vec<crate::router::ModelRule>>>,
+    pub model_pins: Arc<DashMap<String, String>>,  // model -> provider (runtime pinning)
     pub rpm_counter: Arc<crate::stats::RpmCounter>,
     pub last_reloaded: Arc<std::sync::Mutex<Option<String>>>,
 }
@@ -478,6 +516,35 @@ enum SelectResult {
 
 /// Select a provider using model rules; returns SelectResult so the caller can
 /// distinguish between "rule matched but target unavailable" and "no rule".
+/// Normal provider selection (rules + strategy) without pinning
+/// Returns None if rule matched but target is unavailable (should stop retry)
+fn select_provider_normal(
+    model: &str,
+    providers: &[(String, Arc<crate::provider::Provider>)],
+    state: &AppState,
+) -> Option<(String, Arc<crate::provider::Provider>)> {
+    let rules = state.model_rules.read().unwrap();
+    tracing::debug!(
+        model = %model,
+        rules_count = rules.len(),
+        "Selecting provider for model"
+    );
+    match select_with_rules(model, providers, &rules, &state.router) {
+        SelectResult::Provider(p) => Some(p),
+        SelectResult::RuleMatchedButUnavailable(target) => {
+            tracing::warn!(
+                model = %model,
+                target_provider = %target,
+                "Model rule matched but target provider is unavailable, stopping retry"
+            );
+            None  // Signal caller to break retry loop
+        }
+        SelectResult::NoRule => {
+            state.router.select_provider(providers)
+        }
+    }
+}
+
 fn select_with_rules(
     model: &str,
     providers: &[(String, Arc<crate::provider::Provider>)],

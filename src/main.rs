@@ -84,6 +84,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         log_buffer,
         ws_broadcaster: ws_broadcaster.clone(),
         model_rules,
+        model_pins: Arc::new(dashmap::DashMap::new()),
         rpm_counter,
         last_reloaded: Arc::new(std::sync::Mutex::new(None)),
     };

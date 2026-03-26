@@ -21,6 +21,16 @@
 - **实现过程中建议命令**：`/sync-active-work-with-code`
 - **完成后建议命令**：`/review-delivery-completion`
 
+### 运行时 Provider 调度控制
+- **位置**：`docs/active-work/runtime-provider-control/`
+- **状态**：Active
+- **目标**：运行时动态控制 provider 启停与模型级别固定调度
+- **当前范围**：
+  - Spec 01：修复 Routing 页面 toggle 不调 API 的 bug + config 支持 enabled 字段
+  - Spec 02：Model Pinning API 及路由集成（按模型固定到指定 provider）
+- **实施顺序**：先 Spec 01，再 Spec 02
+- **下一步命令**：`/breakdown-active-work`
+
 ## 使用方式
 
 ### 我想看当前计划

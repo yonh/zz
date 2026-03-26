@@ -142,6 +142,15 @@ pub async fn handle_api_request(
             handle_update_rules(req, &state).await
         }
 
+        // Model pins endpoints
+        ("/zz/api/routing/pins", &hyper::Method::GET) => handle_get_pins(&state).await,
+        ("/zz/api/routing/pins", &hyper::Method::PUT) => {
+            handle_update_pins(req, &state).await
+        }
+        (p, &hyper::Method::DELETE) if p.starts_with("/zz/api/routing/pins/") => {
+            handle_delete_pin(req, &state).await
+        }
+
         // Stats endpoints
         ("/zz/api/stats", &hyper::Method::GET) => handle_get_stats(&state).await,
         ("/zz/api/stats/timeseries", &hyper::Method::GET) => {
@@ -322,6 +331,7 @@ async fn handle_add_provider(
         models: add_req.models,
         headers: add_req.headers,
         token_budget: None,
+        enabled: true,
     };
 
     // Add to provider manager
@@ -641,6 +651,113 @@ async fn handle_update_rules(
 
 // ============================================================================
 // Stats Handlers
+
+// ============================================================================
+// Model Pins Handlers
+// ============================================================================
+
+#[derive(Debug, serde::Deserialize)]
+struct ModelPin {
+    model: String,
+    provider: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct UpdatePinsRequest {
+    pins: Vec<ModelPin>,
+}
+
+async fn handle_get_pins(state: &crate::proxy::AppState) -> hyper::Response<ResponseBody> {
+    let pins: Vec<serde_json::Value> = state.model_pins
+        .iter()
+        .map(|entry| {
+            serde_json::json!({
+                "model": entry.key(),
+                "provider": entry.value()
+            })
+        })
+        .collect();
+
+    json_response(&serde_json::json!({ "pins": pins }))
+}
+
+async fn handle_update_pins(
+    req: hyper::Request<Incoming>,
+    state: &crate::proxy::AppState,
+) -> hyper::Response<ResponseBody> {
+    let body_bytes = match req.collect().await {
+        Ok(bytes) => bytes.to_bytes(),
+        Err(_) => return bad_request_response("Failed to read request body"),
+    };
+
+    let update_req: UpdatePinsRequest = match serde_json::from_slice(&body_bytes) {
+        Ok(r) => r,
+        Err(e) => return bad_request_response(&format!("Invalid JSON: {}", e)),
+    };
+
+    for pin in &update_req.pins {
+        if pin.model.is_empty() {
+            return bad_request_response("Model name cannot be empty");
+        }
+        if pin.provider.is_empty() {
+            return bad_request_response("Provider name cannot be empty");
+        }
+        if state.provider_manager.get_by_name(&pin.provider).is_none() {
+            return bad_request_response(&format!("Provider not found: {}", pin.provider));
+        }
+    }
+
+    state.model_pins.clear();
+    for pin in &update_req.pins {
+        state.model_pins.insert(pin.model.clone(), pin.provider.clone());
+        tracing::info!(
+            model = %pin.model,
+            provider = %pin.provider,
+            "Model pinned to provider"
+        );
+    }
+
+    let pins: Vec<serde_json::Value> = state.model_pins
+        .iter()
+        .map(|entry| {
+            serde_json::json!({
+                "model": entry.key(),
+                "provider": entry.value()
+            })
+        })
+        .collect();
+
+    json_response(&serde_json::json!({ "pins": pins }))
+}
+
+async fn handle_delete_pin(
+    req: hyper::Request<Incoming>,
+    state: &crate::proxy::AppState,
+) -> hyper::Response<ResponseBody> {
+    let path = req.uri().path();
+
+    let model = path
+        .strip_prefix("/zz/api/routing/pins/")
+        .map(|s| {
+            // URL decode the model name to handle special characters
+            percent_encoding::percent_decode_str(s)
+                .decode_utf8_lossy()
+                .to_string()
+        });
+
+    match model {
+        Some(model) => {
+            if state.model_pins.remove(&model).is_some() {
+                tracing::info!(model = %model, "Model pin removed");
+                json_response(&serde_json::json!({ "removed": model }))
+            } else {
+                not_found_response(&format!("No pin found for model: {}", model))
+            }
+        }
+        None => bad_request_response("Invalid model in path"),
+    }
+}
+
 // ============================================================================
 
 async fn handle_get_stats(state: &crate::proxy::AppState) -> hyper::Response<ResponseBody> {

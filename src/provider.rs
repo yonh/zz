@@ -26,13 +26,14 @@ pub enum ProviderState {
 
 impl Provider {
     pub fn new(config: crate::config::ProviderConfig) -> Self {
+        let enabled = config.enabled;
         Self {
             config: std::sync::RwLock::new(config),
             state: std::sync::Mutex::new(ProviderState::Healthy),
             request_count: AtomicU64::new(0),
             error_count: AtomicU64::new(0),
             failure_count: std::sync::Mutex::new(0),
-            enabled: AtomicBool::new(true),
+            enabled: AtomicBool::new(enabled),
             latency_history: std::sync::Mutex::new(VecDeque::with_capacity(12)),
             latency_ema: std::sync::Mutex::new(0.0),
             total_prompt_tokens: AtomicU64::new(0),
@@ -353,6 +354,7 @@ impl ProviderManager {
                 cfg.models = provider_config.models.clone();
                 cfg.headers = provider_config.headers.clone();
                 cfg.token_budget = provider_config.token_budget;
+                cfg.enabled = provider_config.enabled;
                 tracing::info!(provider = %provider_config.name, "Updated provider config in-place");
             } else {
                 // Add new provider

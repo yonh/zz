@@ -44,6 +44,7 @@ import {
 } from "@/components/ui/select";
 import { useAppStore } from "@/stores/store";
 import type { RoutingStrategy, Provider } from "@/api/types";
+import { api } from "@/api/client";
 import { cn } from "@/lib/utils";
 
 /**
@@ -162,6 +163,20 @@ function RoundRobinSettings() {
   const toggleProvider = useAppStore((s) => s.toggleProvider);
   const enabledProviders = providers.filter((p) => p.enabled);
 
+  const handleToggle = async (providerName: string, willEnable: boolean) => {
+    try {
+      if (willEnable) {
+        await api.enableProvider(providerName);
+      } else {
+        await api.disableProvider(providerName);
+      }
+      toggleProvider(providerName);
+      toast.success(`${providerName} ${willEnable ? "enabled" : "disabled"}`);
+    } catch (err) {
+      toast.error(`Failed to ${willEnable ? "enable" : "disable"} provider: ${err instanceof Error ? err.message : "unknown error"}`);
+    }
+  };
+
   return (
     <div className="space-y-4">
       <p className="text-sm text-muted-foreground">
@@ -177,7 +192,7 @@ function RoundRobinSettings() {
               <span className="font-medium">{p.name}</span>
             </div>
             <button
-              onClick={() => toggleProvider(p.name)}
+              onClick={() => handleToggle(p.name, !p.enabled)}
               className="flex items-center gap-2 text-sm"
             >
               {p.enabled ? (

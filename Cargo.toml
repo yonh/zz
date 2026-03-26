@@ -20,6 +20,7 @@ anyhow = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 url = "2.5"
 thiserror = "2.0.18"
+percent-encoding = "2.3"
 rand = { version = "0.10.0", features = ["thread_rng"] }
 bytes = "1.11.1"
 futures-util = "0.3.32"
