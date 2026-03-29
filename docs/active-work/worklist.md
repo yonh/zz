@@ -31,6 +31,16 @@
 - **实施顺序**：先 Spec 01，再 Spec 02
 - **下一步命令**：`/breakdown-active-work`
 
+### LLM 请求全量日志
+- **位置**：`docs/active-work/llm-request-journal/`
+- **状态**：Active
+- **目标**：查看 Claude / Codex / Cursor 等客户端实际发送到 ZZ 的完整 LLM 请求日志
+- **当前范围**：
+  - Spec 01：后端全量捕获并持久化请求日志（含 headers / body / client 标识）
+  - Spec 02：日志查询 API、详情查看、导出与 UI 浏览器
+- **关键要求**：不是现有 metadata logs，而是可用于排查 `thinking_budget` 等参数问题的原始请求日志
+- **下一步命令**：`/breakdown-active-work`
+
 ## 使用方式
 
 ### 我想看当前计划

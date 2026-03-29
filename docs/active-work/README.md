@@ -27,5 +27,6 @@ Active
 - [worklist.md](./worklist.md) - 当前工作列表
 - [codex-responses/](./codex-responses/) - OpenAI Responses API 支持的当前交付批次
 - [runtime-provider-control/](./runtime-provider-control/) - 运行时 Provider 调度控制（启停 + Model Pinning）
+- [llm-request-journal/](./llm-request-journal/) - LLM 请求全量日志（查看编辑器实际发送内容）
 
 代码整改批次已归档到 `docs/completed/code-remediation/`。
