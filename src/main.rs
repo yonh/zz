@@ -11,6 +11,7 @@ mod cors;
 mod stats;
 mod admin_api;
 mod ws;
+mod request_journal;
 
 use clap::Parser;
 use std::sync::Arc;
@@ -73,6 +74,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             target_provider: r.target_provider.clone(),
         }).collect::<Vec<_>>()
     ));
+    let request_journal = Arc::new(request_journal::RequestJournalWriter::new(
+        cfg.observability.request_journal.clone()
+    ));
     let start_time = Instant::now();
 
     let state = proxy::AppState {
@@ -86,6 +90,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         model_rules,
         model_pins: Arc::new(dashmap::DashMap::new()),
         rpm_counter,
+        request_journal,
         last_reloaded: Arc::new(std::sync::Mutex::new(None)),
     };
 

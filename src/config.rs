@@ -7,6 +7,54 @@ pub struct Config {
     pub health: HealthConfig,
     #[serde(rename = "providers")]
     pub provider_configs: Vec<ProviderConfig>,
+    #[serde(default)]
+    pub observability: ObservabilityConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ObservabilityConfig {
+    #[serde(default)]
+    pub request_journal: RequestJournalConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RequestJournalConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_request_journal_storage_dir")]
+    pub storage_dir: String,
+    #[serde(default = "default_request_journal_retention_days")]
+    pub retention_days: u64,
+    #[serde(default = "default_redact_headers")]
+    pub redact_headers: Vec<String>,
+}
+
+impl Default for RequestJournalConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true, // 默认启用，方便调试和问题排查
+            storage_dir: default_request_journal_storage_dir(),
+            retention_days: default_request_journal_retention_days(),
+            redact_headers: default_redact_headers(),
+        }
+    }
+}
+
+fn default_request_journal_storage_dir() -> String {
+    "logs/request-journal".to_string()
+}
+
+fn default_request_journal_retention_days() -> u64 {
+    7
+}
+
+fn default_redact_headers() -> Vec<String> {
+    vec![
+        "authorization".to_string(),
+        "x-api-key".to_string(),
+        "cookie".to_string(),
+        "set-cookie".to_string(),
+    ]
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -123,10 +171,16 @@ impl Config {
                 return Err(anyhow::anyhow!("Provider name is required"));
             }
             if provider.base_url.is_empty() {
-                return Err(anyhow::anyhow!("Provider base_url is required for {}", provider.name));
+                return Err(anyhow::anyhow!(
+                    "Provider base_url is required for {}",
+                    provider.name
+                ));
             }
             if provider.api_key.is_empty() {
-                return Err(anyhow::anyhow!("Provider api_key is required for {}", provider.name));
+                return Err(anyhow::anyhow!(
+                    "Provider api_key is required for {}",
+                    provider.name
+                ));
             }
         }
 

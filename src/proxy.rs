@@ -38,6 +38,7 @@ pub async fn proxy_handler(
     let model = extract_model(&body_bytes);
     let mut failover_chain: Vec<String> = Vec::new();
     let mut final_provider = String::new();
+    let mut final_upstream_url = String::new();
     let mut final_status: u16 = 503;
     let mut response_bytes: u64 = 0;
     let mut ttfb_ms: u64 = 0;
@@ -175,19 +176,18 @@ pub async fn proxy_handler(
             is_sse,
             request_timeout_secs,
         ).await {
-            Ok((response, resp_bytes, resp_ttfb_ms, token_usage)) => {
+            Ok((response, resp_bytes, resp_ttfb_ms, token_usage, upstream_url)) => {
                 let status_code = response.status().as_u16();
                 failover_chain.push(format!("{}:{}", provider_name, status_code));
                 final_provider = provider_name.clone();
+                final_upstream_url = upstream_url;
                 final_status = status_code;
                 response_bytes = resp_bytes;
                 ttfb_ms = resp_ttfb_ms;
 
-                // Record latency
                 let latency_ms = proxy_start.elapsed().as_millis() as u64;
                 provider.record_latency(latency_ms);
 
-                // Record token usage if available
                 if let Some(ref usage) = token_usage {
                     state.provider_manager.record_tokens(
                         &provider_name,
@@ -196,7 +196,6 @@ pub async fn proxy_handler(
                     );
                 }
 
-                // Build and store log entry
                 let log_entry = crate::stats::LogEntry {
                     id: request_id.clone(),
                     timestamp: chrono::Utc::now().to_rfc3339(),
@@ -221,18 +220,55 @@ pub async fn proxy_handler(
                 state.rpm_counter.increment();
                 state.ws_broadcaster.broadcast_log(log_entry);
 
+                write_request_journal(
+                    &state,
+                    request_id.clone(),
+                    &headers,
+                    &body_bytes,
+                    &method,
+                    &path,
+                    &final_provider,
+                    &final_upstream_url,
+                    &model,
+                    is_sse,
+                    final_status,
+                    request_bytes,
+                    response_bytes,
+                    if failover_chain.len() > 1 { Some(failover_chain.clone()) } else { None },
+                    None,
+                );
+
                 return Ok(response);
             }
             Err(e) => {
                 failover_chain.push(format!("{}:err", provider_name));
+                final_provider = provider_name.clone();
                 
-                // If this is a pinned provider, don't retry - return error immediately
                 if is_pinned {
                     tracing::error!(
                         provider = %provider_name,
                         error = %e,
                         "Pinned provider failed, returning error without retry"
                     );
+                    
+                    write_request_journal(
+                        &state,
+                        request_id,
+                        &headers,
+                        &body_bytes,
+                        &method,
+                        &path,
+                        &final_provider,
+                        "",
+                        &model,
+                        is_sse,
+                        503,
+                        request_bytes,
+                        0,
+                        if failover_chain.len() > 1 { Some(failover_chain) } else { None },
+                        Some(e.to_string()),
+                    );
+                    
                     return Err(e);
                 }
                 
@@ -253,24 +289,42 @@ pub async fn proxy_handler(
 
     // Log failed request
     let log_entry = crate::stats::LogEntry {
-        id: request_id,
+        id: request_id.clone(),
         timestamp: chrono::Utc::now().to_rfc3339(),
         method: method.to_string(),
         path: path.clone(),
-        provider: final_provider,
+        provider: final_provider.clone(),
         status: 503,
         duration_ms: proxy_start.elapsed().as_millis() as u64,
         ttfb_ms: 0,
-        model,
+        model: model.clone(),
         streaming: is_sse,
         request_bytes,
         response_bytes: 0,
-        failover_chain: if failover_chain.len() > 1 { Some(failover_chain) } else { None },
+        failover_chain: if failover_chain.len() > 1 { Some(failover_chain.clone()) } else { None },
         token_usage: None,
     };
     state.log_buffer.push(log_entry.clone());
     state.rpm_counter.increment();
     state.ws_broadcaster.broadcast_log(log_entry);
+
+    write_request_journal(
+        &state,
+        request_id,
+        &headers,
+        &body_bytes,
+        &method,
+        &path,
+        &final_provider,
+        &final_upstream_url,
+        &model,
+        is_sse,
+        503,
+        request_bytes,
+        0,
+        if failover_chain.len() > 1 { Some(failover_chain) } else { None },
+        Some(error_msg.clone()),
+    );
 
     Ok(hyper::Response::builder()
         .status(hyper::StatusCode::SERVICE_UNAVAILABLE)
@@ -292,7 +346,7 @@ async fn attempt_request(
     state: &AppState,
     is_sse: bool,
     request_timeout_secs: u64,
-) -> Result<(hyper::Response<ResponseBody>, u64, u64, Option<crate::stats::TokenUsage>), crate::error::ProxyError> {
+) -> Result<(hyper::Response<ResponseBody>, u64, u64, Option<crate::stats::TokenUsage>, String), crate::error::ProxyError> {
     // Returns: (response, response_bytes, ttfb_ms, token_usage)
     // Extract config values (needed to avoid holding RwLock across await)
     let (base_url, api_key, extra_headers) = {
@@ -394,11 +448,10 @@ async fn attempt_request(
         }
 
         let resp_bytes = response_bytes.len() as u64;
-        // Try to extract token usage from error response (some APIs include it)
         let token_usage = extract_token_usage(&response_bytes);
         return Ok((downstream_response
             .body(full(response_bytes))
-            .unwrap(), resp_bytes, ttfb_ms, token_usage));
+            .unwrap(), resp_bytes, ttfb_ms, token_usage, upstream_url));
     }
 
     // Success response
@@ -426,12 +479,9 @@ async fn attempt_request(
             downstream_response = downstream_response.header(name, value);
         }
 
-        // SSE streaming response is passed through directly without token usage extraction.
-        // Token usage from streaming responses (last SSE chunk) is not currently collected.
-        // This is a known limitation. See FIX-06 in docs/active-work/code-remediation/spec.md.
         Ok((downstream_response
             .body(body)
-            .unwrap(), 0, ttfb_ms, None))
+            .unwrap(), 0, ttfb_ms, None, upstream_url))
     } else {
         // Buffer response for non-SSE
         let resp_bytes = response.collect().await
@@ -450,7 +500,7 @@ async fn attempt_request(
 
         Ok((downstream_response
             .body(full(resp_bytes))
-            .unwrap(), response_bytes_val, ttfb_ms, token_usage))
+            .unwrap(), response_bytes_val, ttfb_ms, token_usage, upstream_url))
     }
 }
 
@@ -464,8 +514,9 @@ pub struct AppState {
     pub log_buffer: Arc<crate::stats::RequestLogBuffer>,
     pub ws_broadcaster: Arc<crate::ws::WsBroadcaster>,
     pub model_rules: Arc<std::sync::RwLock<Vec<crate::router::ModelRule>>>,
-    pub model_pins: Arc<DashMap<String, String>>,  // model -> provider (runtime pinning)
+    pub model_pins: Arc<DashMap<String, String>>,
     pub rpm_counter: Arc<crate::stats::RpmCounter>,
+    pub request_journal: Arc<crate::request_journal::RequestJournalWriter>,
     pub last_reloaded: Arc<std::sync::Mutex<Option<String>>>,
 }
 
@@ -474,10 +525,8 @@ impl AppState {
         let new_config = crate::config::Config::load(&self.config_path)
             .map_err(|e| format!("Failed to load config: {}", e))?;
 
-        // Update provider manager
         self.provider_manager.reload(&new_config);
 
-        // Sync model rules from config (config file is authoritative on reload)
         let new_rules: Vec<crate::router::ModelRule> = new_config.routing.rules
             .iter()
             .enumerate()
@@ -489,16 +538,13 @@ impl AppState {
             .collect();
         *self.model_rules.write().unwrap() = new_rules;
 
-        // Update config
-        {
-            let mut config = self.config.write().unwrap();
-            *config = new_config;
-        }
-
-        // Update last_reloaded timestamp
+        let journal_config = new_config.observability.request_journal.clone();
+        *self.config.write().unwrap() = new_config;
+        
+        self.request_journal.update_config(journal_config);
+        
         let now = chrono::Utc::now().to_rfc3339();
         *self.last_reloaded.lock().unwrap() = Some(now);
-
         tracing::info!("Config reloaded successfully");
         Ok(())
     }
@@ -757,4 +803,72 @@ fn extract_usage_details(usage: &serde_json::Value) -> Option<serde_json::Value>
     } else {
         Some(serde_json::Value::Object(details))
     }
+}
+
+fn write_request_journal(
+    state: &AppState,
+    request_id: String,
+    headers: &hyper::HeaderMap,
+    body_bytes: &Bytes,
+    method: &hyper::Method,
+    path: &str,
+    provider: &str,
+    upstream_url: &str,
+    model: &str,
+    streaming: bool,
+    status: u16,
+    request_bytes: u64,
+    response_bytes: u64,
+    failover_chain: Option<Vec<String>>,
+    error: Option<String>,
+) {
+    if !state.request_journal.is_enabled() {
+        return;
+    }
+
+    let user_agent = headers
+        .get(hyper::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    let client_name = crate::request_journal::infer_client_name(user_agent);
+    let request_headers = state.request_journal.redact_headers(headers);
+
+    let content_type = headers
+        .get(hyper::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    let (request_body_text, request_body_base64) = if let Ok(text) = std::str::from_utf8(body_bytes) {
+        (Some(text.to_string()), None)
+    } else {
+        (None, Some(base64::Engine::encode(&base64::engine::general_purpose::STANDARD, body_bytes)))
+    };
+
+    let entry = crate::request_journal::RequestJournalEntry {
+        id: request_id,
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        client_name,
+        user_agent: user_agent.to_string(),
+        method: method.to_string(),
+        path: path.to_string(),
+        provider: provider.to_string(),
+        upstream_url: upstream_url.to_string(),
+        model: model.to_string(),
+        streaming,
+        status,
+        request_headers,
+        request_content_type: content_type.to_string(),
+        request_body_text,
+        request_body_base64,
+        request_bytes,
+        response_bytes,
+        failover_chain,
+        error,
+    };
+
+    let journal = state.request_journal.clone();
+    tokio::spawn(async move {
+        journal.write_entry(entry).await;
+    });
 }

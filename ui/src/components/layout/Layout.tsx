@@ -8,6 +8,7 @@ import {
   Moon,
   Sun,
   Zap,
+  FileSearch,
 } from "lucide-react";
 import { useAppStore } from "@/stores/store";
 import { cn } from "@/lib/utils";
@@ -17,6 +18,7 @@ const navItems = [
   { to: "/providers", label: "Providers", icon: Server },
   { to: "/routing", label: "Routing", icon: Route },
   { to: "/logs", label: "Logs", icon: ScrollText },
+  { to: "/request-journal", label: "Journal", icon: FileSearch },
   { to: "/config", label: "Config", icon: Settings },
 ];
 

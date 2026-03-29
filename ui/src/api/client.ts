@@ -6,6 +6,10 @@ import type {
   SystemStats,
   TimeSeriesPoint,
   LogEntry,
+  RequestJournalEntry,
+  RequestJournalListResponse,
+  RequestJournalQuery,
+  RequestJournalStatus,
 } from "./types";
 
 const API_BASE = "/zz/api";
@@ -18,6 +22,16 @@ async function apiFetch<T>(path: string, options?: RequestInit): Promise<T> {
   if (!resp.ok) throw new Error(`API error: ${resp.status}`);
   if (resp.status === 204) return undefined as T;
   return resp.json();
+}
+
+function buildQueryString(params: Record<string, string | number | undefined>): string {
+  const parts: string[] = [];
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined) {
+      parts.push(`${encodeURIComponent(key)}=${encodeURIComponent(String(value))}`);
+    }
+  }
+  return parts.length > 0 ? `?${parts.join("&")}` : "";
 }
 
 export const api = {
@@ -72,4 +86,33 @@ export const api = {
     apiFetch<{ status: string }>("/health"),
   getVersion: () =>
     apiFetch<{ version: string; build: string }>("/version"),
+
+  getRequestJournalStatus: () =>
+    apiFetch<RequestJournalStatus>("/request-journal/status"),
+  getRequestJournal: (query: RequestJournalQuery & { offset?: number; limit?: number }) => {
+    const qs = buildQueryString({
+      client: query.client,
+      provider: query.provider,
+      model: query.model,
+      status: query.status,
+      path: query.path,
+      date: query.date,
+      offset: query.offset,
+      limit: query.limit,
+    });
+    return apiFetch<RequestJournalListResponse>(`/request-journal${qs}`);
+  },
+  getRequestJournalEntry: (id: string) =>
+    apiFetch<RequestJournalEntry>(`/request-journal/${id}`),
+  exportRequestJournal: (query: RequestJournalQuery) => {
+    const qs = buildQueryString({
+      client: query.client,
+      provider: query.provider,
+      model: query.model,
+      status: query.status,
+      path: query.path,
+      date: query.date,
+    });
+    window.open(`${API_BASE}/request-journal/export${qs}`, "_blank");
+  },
 };

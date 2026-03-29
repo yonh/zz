@@ -75,6 +75,12 @@ fn extract_provider_name(path: &str, prefix: &str) -> Option<String> {
     Some(rest[..end].to_string())
 }
 
+fn extract_request_id(path: &str, prefix: &str) -> Option<String> {
+    let rest = path.strip_prefix(prefix)?;
+    let end = rest.find('/').unwrap_or(rest.len());
+    Some(rest[..end].to_string())
+}
+
 /// Main entry point for API request handling
 pub async fn handle_api_request(
     req: hyper::Request<Incoming>,
@@ -158,6 +164,20 @@ pub async fn handle_api_request(
         }
         ("/zz/api/logs", &hyper::Method::GET) => {
             handle_get_logs(req.uri(), &state).await
+        }
+
+        ("/zz/api/request-journal", &hyper::Method::GET) => {
+            handle_list_request_journal(req.uri(), &state).await
+        }
+        ("/zz/api/request-journal/status", &hyper::Method::GET) => {
+            handle_request_journal_status(&state).await
+        }
+        ("/zz/api/request-journal/export", &hyper::Method::GET) => {
+            handle_export_request_journal(req.uri(), &state).await
+        }
+        (p, &hyper::Method::GET) if p.starts_with("/zz/api/request-journal/") && !p.contains("/export") && !p.contains("/status") => {
+            let id = extract_request_id(p, "/zz/api/request-journal/")?;
+            handle_get_request_journal_entry(&id, &state).await
         }
 
         // Config endpoints
@@ -969,4 +989,147 @@ async fn handle_version() -> hyper::Response<ResponseBody> {
         "build_time": chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
         "rust_version": env!("CARGO_PKG_RUST_VERSION")
     }))
+}
+
+// ============================================================================
+// Request Journal Handlers
+// ============================================================================
+
+async fn handle_request_journal_status(
+    state: &crate::proxy::AppState,
+) -> hyper::Response<ResponseBody> {
+    let enabled = state.request_journal.is_enabled();
+    let storage_dir = state.request_journal.storage_dir();
+    
+    let total_entries = if enabled {
+        let base_path = std::path::PathBuf::from(&storage_dir);
+        if base_path.exists() {
+            let mut count = 0usize;
+            if let Ok(date_dirs) = std::fs::read_dir(&base_path) {
+                for entry in date_dirs.flatten() {
+                    if entry.path().is_dir() {
+                        if let Ok(files) = std::fs::read_dir(entry.path()) {
+                            for file in files.flatten() {
+                                if file.path().extension().map(|e| e == "json").unwrap_or(false) {
+                                    count += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            count
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+
+    json_response(&serde_json::json!({
+        "enabled": enabled,
+        "storage_path": storage_dir,
+        "total_entries": total_entries
+    }))
+}
+
+async fn handle_list_request_journal(
+    uri: &hyper::Uri,
+    state: &crate::proxy::AppState,
+) -> hyper::Response<ResponseBody> {
+    let enabled = state.request_journal.is_enabled();
+    
+    if !enabled {
+        return json_response(&serde_json::json!({
+            "enabled": false,
+            "entries": [],
+            "total": 0,
+            "offset": 0,
+            "limit": 50,
+            "message": "Request journal is disabled. Enable it in config.toml [observability.request_journal] enabled = true"
+        }));
+    }
+    
+    let params = parse_query_params(uri);
+    
+    let offset: usize = params.get("offset")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let limit: usize = params.get("limit")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(50)
+        .min(200);
+
+    let query = crate::request_journal::JournalQuery {
+        client: params.get("client").cloned(),
+        provider: params.get("provider").cloned(),
+        model: params.get("model").cloned(),
+        status: params.get("status").and_then(|v| v.parse().ok()),
+        path: params.get("path").cloned(),
+        date: params.get("date").cloned(),
+    };
+
+    let storage_dir = state.request_journal.storage_dir();
+    
+    match crate::request_journal::list_entries(&storage_dir, query, offset, limit).await {
+        Ok((entries, total)) => {
+            json_response(&serde_json::json!({
+                "enabled": true,
+                "entries": entries,
+                "total": total,
+                "offset": offset,
+                "limit": limit
+            }))
+        }
+        Err(e) => error_response(&e, hyper::StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+async fn handle_get_request_journal_entry(
+    id: &str,
+    state: &crate::proxy::AppState,
+) -> hyper::Response<ResponseBody> {
+    let storage_dir = state.request_journal.storage_dir();
+    
+    match crate::request_journal::get_entry(&storage_dir, id).await {
+        Ok(Some(entry)) => json_response(&entry),
+        Ok(None) => not_found_response(&format!("Request journal entry not found: {}", id)),
+        Err(e) => error_response(&e, hyper::StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+async fn handle_export_request_journal(
+    uri: &hyper::Uri,
+    state: &crate::proxy::AppState,
+) -> hyper::Response<ResponseBody> {
+    let params = parse_query_params(uri);
+    
+    let query = crate::request_journal::JournalQuery {
+        client: params.get("client").cloned(),
+        provider: params.get("provider").cloned(),
+        model: params.get("model").cloned(),
+        status: params.get("status").and_then(|v| v.parse().ok()),
+        path: params.get("path").cloned(),
+        date: params.get("date").cloned(),
+    };
+
+    let storage_dir = state.request_journal.storage_dir();
+    
+    match crate::request_journal::export_entries(&storage_dir, query).await {
+        Ok(entries) => {
+            let json = serde_json::to_string_pretty(&entries).unwrap_or_else(|_| "[]".to_string());
+            let mut resp = hyper::Response::new(full(json));
+            resp.headers_mut().insert(
+                hyper::header::CONTENT_TYPE,
+                "application/json".parse().unwrap(),
+            );
+            resp.headers_mut().insert(
+                hyper::header::CONTENT_DISPOSITION,
+                "attachment; filename=\"request-journal-export.json\"".parse().unwrap(),
+            );
+            crate::cors::add_cors_headers(&mut resp);
+            resp
+        }
+        Err(e) => error_response(&e, hyper::StatusCode::INTERNAL_SERVER_ERROR),
+    }
 }

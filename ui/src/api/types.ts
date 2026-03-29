@@ -153,3 +153,64 @@ export interface TrafficEntry {
   percentage: number;
   color: string;
 }
+
+export interface RequestJournalEntry {
+  id: string;
+  timestamp: string;
+  client_name: string;
+  user_agent: string;
+  method: string;
+  path: string;
+  provider: string;
+  upstream_url: string;
+  model: string;
+  streaming: boolean;
+  status: number;
+  request_headers: Record<string, string>;
+  request_content_type: string;
+  request_body_text?: string;
+  request_body_base64?: string;
+  request_bytes: number;
+  response_bytes: number;
+  failover_chain?: string[];
+  error?: string;
+}
+
+export interface RequestJournalSummary {
+  id: string;
+  timestamp: string;
+  client_name: string;
+  user_agent: string;
+  method: string;
+  path: string;
+  provider: string;
+  model: string;
+  streaming: boolean;
+  status: number;
+  request_bytes: number;
+  response_bytes: number;
+}
+
+export interface RequestJournalStatus {
+  enabled: boolean;
+  storage_path: string;
+  total_entries: number;
+}
+
+export interface RequestJournalListResponse {
+  enabled?: boolean;
+  message?: string;
+  entries: RequestJournalSummary[];
+  total: number;
+  offset: number;
+  limit: number;
+}
+
+export interface RequestJournalQuery {
+  client?: string;
+  provider?: string;
+  model?: string;
+  status?: number;
+  path?: string;
+  date?: string;
+}

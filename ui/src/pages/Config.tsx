@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import {
   Save,
   RotateCcw,
@@ -8,31 +8,44 @@ import {
   FileText,
   Eye,
   EyeOff,
+  Loader2,
 } from "lucide-react";
 import { toast } from "sonner";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
-import { useAppStore } from "@/stores/store";
+import { api } from "@/api/client";
 
-/**
- * Config page with TOML editor and validation.
- */
 export default function Config() {
-  const configToml = useAppStore((s) => s.configToml);
-  const [localConfig, setLocalConfig] = useState(configToml);
+  const [localConfig, setLocalConfig] = useState("");
+  const [originalConfig, setOriginalConfig] = useState("");
   const [isValid, setIsValid] = useState(true);
   const [savedMsg, setSavedMsg] = useState(false);
   const [showKeys, setShowKeys] = useState(false);
-  const [lastModified, setLastModified] = useState(new Date());
-  const [lastReloaded, setLastReloaded] = useState<Date | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [lastReloaded, setLastReloaded] = useState<string | null>(null);
 
-  const isDirty = localConfig !== configToml;
+  const isDirty = localConfig !== originalConfig;
 
-  /**
-   * Mask API keys in TOML content.
-   */
+  useEffect(() => {
+    loadConfig();
+  }, []);
+
+  async function loadConfig() {
+    setLoading(true);
+    try {
+      const response = await api.getConfig();
+      setLocalConfig(response.content);
+      setOriginalConfig(response.content);
+    } catch (error) {
+      toast.error("Failed to load config");
+    } finally {
+      setLoading(false);
+    }
+  }
+
   function maskApiKeys(text: string): string {
     return text.replace(
       /api_key\s*=\s*"([^"]+)"/g,
@@ -42,50 +55,38 @@ export default function Config() {
 
   const displayConfig = showKeys ? localConfig : maskApiKeys(localConfig);
 
-  /**
-   * Simple TOML validation heuristic (mock).
-   */
-  function validateConfig(text: string): boolean {
-    if (!text.trim()) return false;
-    if (!text.includes("[server]")) return false;
-    if (!text.includes("[[providers]]")) return false;
-    return true;
+  async function handleSave() {
+    if (!isValid || !isDirty) return;
+    
+    setSaving(true);
+    try {
+      const validation = await api.validateConfig(localConfig);
+      if (!validation.valid) {
+        toast.error(validation.errors?.join("\n") || "Invalid config");
+        setIsValid(false);
+        return;
+      }
+      
+      await api.updateConfig(localConfig);
+      setOriginalConfig(localConfig);
+      setSavedMsg(true);
+      setLastReloaded(new Date().toLocaleString());
+      toast.success("Config saved & reloaded");
+      setTimeout(() => setSavedMsg(false), 3000);
+    } catch (error) {
+      toast.error("Failed to save config");
+    } finally {
+      setSaving(false);
+    }
   }
 
-  /**
-   * Handle config text change with validation.
-   */
-  function handleChange(value: string) {
-    setLocalConfig(value);
-    setIsValid(validateConfig(value));
-    setSavedMsg(false);
-    setLastModified(new Date());
-  }
-
-  /**
-   * Simulate saving and reloading config.
-   */
-  function handleSave() {
-    if (!isValid) return;
-    setSavedMsg(true);
-    setLastReloaded(new Date());
-    toast.success("Config saved & reloaded");
-    setTimeout(() => setSavedMsg(false), 3000);
-  }
-
-  /**
-   * Reset editor to last saved config.
-   */
   function handleReset() {
-    setLocalConfig(configToml);
+    setLocalConfig(originalConfig);
     setIsValid(true);
     setSavedMsg(false);
     toast.info("Config reset to last saved version");
   }
 
-  /**
-   * Download config as .toml file.
-   */
   function handleDownload() {
     const blob = new Blob([localConfig], { type: "text/plain" });
     const url = URL.createObjectURL(blob);
@@ -94,6 +95,22 @@ export default function Config() {
     a.download = "config.toml";
     a.click();
     URL.revokeObjectURL(url);
+  }
+
+  function handleChange(value: string) {
+    setLocalConfig(value);
+    setSavedMsg(false);
+    if (value.includes("[server]") && value.includes("[[providers]]")) {
+      setIsValid(true);
+    }
+  }
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center h-64">
+        <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
+      </div>
+    );
   }
 
   return (
@@ -154,10 +171,15 @@ export default function Config() {
             <div className="flex items-center gap-2">
               <Button
                 onClick={handleSave}
-                disabled={!isValid || !isDirty}
+                disabled={!isValid || !isDirty || saving}
                 className="gap-2"
               >
-                <Save className="h-4 w-4" /> Save & Reload
+                {saving ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : (
+                  <Save className="h-4 w-4" />
+                )}
+                Save & Reload
               </Button>
               <Button
                 variant="outline"
@@ -188,12 +210,9 @@ export default function Config() {
         <CardContent className="pt-6">
           <div className="flex items-center justify-between text-sm text-muted-foreground">
             <span>Config File Path: ~/.config/zz/config.toml</span>
-            <div className="space-x-4">
-              <span>Last modified: {lastModified.toLocaleString()}</span>
-              {lastReloaded && (
-                <span>Last reloaded: {lastReloaded.toLocaleString()}</span>
-              )}
-            </div>
+            {lastReloaded && (
+              <span>Last reloaded: {lastReloaded}</span>
+            )}
           </div>
         </CardContent>
       </Card>

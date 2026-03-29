@@ -7,6 +7,7 @@ import Providers from "@/pages/Providers";
 import Routing from "@/pages/Routing";
 import Logs from "@/pages/Logs";
 import Config from "@/pages/Config";
+import RequestJournal from "@/pages/RequestJournal";
 import { useAppStore } from "@/stores/store";
 import { useWebSocket } from "@/hooks/useWebSocket";
 
@@ -84,6 +85,7 @@ function App() {
           <Route path="/providers" element={<Providers />} />
           <Route path="/routing" element={<Routing />} />
           <Route path="/logs" element={<Logs />} />
+          <Route path="/request-journal" element={<RequestJournal />} />
           <Route path="/config" element={<Config />} />
         </Route>
       </Routes>
