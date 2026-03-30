@@ -15,6 +15,82 @@ pub struct Config {
 pub struct ObservabilityConfig {
     #[serde(default)]
     pub request_journal: RequestJournalConfig,
+    #[serde(default)]
+    pub timing: TimingConfig,
+    #[serde(default)]
+    pub tracing: TracingConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TimingConfig {
+    #[serde(default = "default_timing_enabled")]
+    pub enabled: bool,
+}
+
+impl Default for TimingConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+fn default_timing_enabled() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TracingConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_tracing_sampling_mode")]
+    pub sampling_mode: String,
+    #[serde(default = "default_tracing_base_rate")]
+    pub base_rate: f64,
+    #[serde(default = "default_tracing_slow_threshold_ms")]
+    pub slow_threshold_ms: u64,
+    #[serde(default = "default_tracing_error_sampling")]
+    pub error_sampling: f64,
+    #[serde(default = "default_tracing_storage_dir")]
+    pub storage_dir: String,
+    #[serde(default = "default_tracing_retention_days")]
+    pub retention_days: u64,
+}
+
+impl Default for TracingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            sampling_mode: default_tracing_sampling_mode(),
+            base_rate: default_tracing_base_rate(),
+            slow_threshold_ms: default_tracing_slow_threshold_ms(),
+            error_sampling: default_tracing_error_sampling(),
+            storage_dir: default_tracing_storage_dir(),
+            retention_days: default_tracing_retention_days(),
+        }
+    }
+}
+
+fn default_tracing_sampling_mode() -> String {
+    "adaptive".to_string()
+}
+
+fn default_tracing_base_rate() -> f64 {
+    0.01
+}
+
+fn default_tracing_slow_threshold_ms() -> u64 {
+    3000
+}
+
+fn default_tracing_error_sampling() -> f64 {
+    1.0
+}
+
+fn default_tracing_storage_dir() -> String {
+    "logs/traces".to_string()
+}
+
+fn default_tracing_retention_days() -> u64 {
+    3
 }
 
 #[derive(Debug, Clone, Deserialize)]

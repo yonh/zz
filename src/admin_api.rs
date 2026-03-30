@@ -177,7 +177,7 @@ pub async fn handle_api_request(
         }
         (p, &hyper::Method::GET) if p.starts_with("/zz/api/request-journal/") && !p.contains("/export") && !p.contains("/status") => {
             let id = extract_request_id(p, "/zz/api/request-journal/")?;
-            handle_get_request_journal_entry(&id, &state).await
+            handle_get_request_journal_entry(&id, req.uri(), &state).await
         }
 
         // Config endpoints
@@ -1067,10 +1067,12 @@ async fn handle_list_request_journal(
         status: params.get("status").and_then(|v| v.parse().ok()),
         path: params.get("path").cloned(),
         date: params.get("date").cloned(),
+        failed_only: params.get("failed").map(|v| v == "true").unwrap_or(false),
+        slow_only: params.get("slow").map(|v| v == "true").unwrap_or(false),
     };
 
     let storage_dir = state.request_journal.storage_dir();
-    
+
     match crate::request_journal::list_entries(&storage_dir, query, offset, limit).await {
         Ok((entries, total)) => {
             json_response(&serde_json::json!({
@@ -1087,14 +1089,57 @@ async fn handle_list_request_journal(
 
 async fn handle_get_request_journal_entry(
     id: &str,
+    uri: &hyper::Uri,
     state: &crate::proxy::AppState,
 ) -> hyper::Response<ResponseBody> {
     let storage_dir = state.request_journal.storage_dir();
-    
+
+    let params = parse_query_params(uri);
+    let format = params.get("format").map(|v| v.as_str()).unwrap_or("json");
+
+    if format == "summary" {
+        match crate::request_journal::get_entry(&storage_dir, id).await {
+            Ok(Some(entry)) => {
+                let summary = crate::request_journal::format_timing_summary(&entry);
+                let mut resp = hyper::Response::new(full(summary));
+                resp.headers_mut().insert(
+                    hyper::header::CONTENT_TYPE,
+                    "text/plain; charset=utf-8".parse().unwrap(),
+                );
+                crate::cors::add_cors_headers(&mut resp);
+                return resp;
+            }
+            Ok(None) => return not_found_response(&format!("Request journal entry not found: {}", id)),
+            Err(e) => return bad_request_response(&e),
+        }
+    }
+
     match crate::request_journal::get_entry(&storage_dir, id).await {
-        Ok(Some(entry)) => json_response(&entry),
+        Ok(Some(entry)) => {
+            let include_trace = params.get("include_trace").map(|v| v == "true").unwrap_or(false);
+
+            if include_trace {
+                let mut response = serde_json::to_value(&entry)
+                    .unwrap_or_else(|e| {
+                        tracing::error!(error = %e, "Failed to serialize journal entry");
+                        serde_json::json!({"error": "serialization failed"})
+                    });
+                let trace_storage_dir = state.config.read().unwrap().observability.tracing.storage_dir.clone();
+                if let Some(trace) = crate::trace_layer::get_trace(&trace_storage_dir, id).await {
+                    if let Some(obj) = response.as_object_mut() {
+                        obj.insert(
+                            "trace".to_string(),
+                            serde_json::to_value(&trace).unwrap_or(serde_json::Value::Null),
+                        );
+                    }
+                }
+                json_response(&response)
+            } else {
+                json_response(&entry)
+            }
+        }
         Ok(None) => not_found_response(&format!("Request journal entry not found: {}", id)),
-        Err(e) => error_response(&e, hyper::StatusCode::INTERNAL_SERVER_ERROR),
+        Err(e) => bad_request_response(&e),
     }
 }
 
@@ -1111,10 +1156,12 @@ async fn handle_export_request_journal(
         status: params.get("status").and_then(|v| v.parse().ok()),
         path: params.get("path").cloned(),
         date: params.get("date").cloned(),
+        failed_only: params.get("failed").map(|v| v == "true").unwrap_or(false),
+        slow_only: params.get("slow").map(|v| v == "true").unwrap_or(false),
     };
 
     let storage_dir = state.request_journal.storage_dir();
-    
+
     match crate::request_journal::export_entries(&storage_dir, query).await {
         Ok(entries) => {
             let json = serde_json::to_string_pretty(&entries).unwrap_or_else(|_| "[]".to_string());

@@ -12,6 +12,7 @@ mod stats;
 mod admin_api;
 mod ws;
 mod request_journal;
+mod trace_layer;
 
 use clap::Parser;
 use std::sync::Arc;
@@ -56,8 +57,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cfg.server.log_level = log_level;
     }
 
-    // Initialize logging
-    logging::init_logging(&cfg.server.log_level)?;
+    // Initialize logging (with optional trace layer)
+    let (trace_layer, trace_sampler) = if cfg.observability.tracing.enabled {
+        let tracing_config = cfg.observability.tracing.clone();
+        let storage_dir = tracing_config.storage_dir.clone();
+        let (tx, rx) = tokio::sync::mpsc::channel(1000);
+        let sampler = Arc::new(crate::trace_layer::TraceSampler::new(tracing_config));
+        let layer = crate::trace_layer::JournalTraceLayer::new_with_sampler(sampler.clone(), tx);
+        // Spawn trace writer as background task
+        tokio::spawn(crate::trace_layer::spawn_trace_writer(rx, storage_dir));
+        (Some(layer), Some(sampler))
+    } else {
+        (None, None)
+    };
+    logging::init_logging(&cfg.server.log_level, trace_layer)?;
 
     tracing::info!(listen = %cfg.server.listen, "Starting ZZ proxy");
 
@@ -92,6 +105,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         rpm_counter,
         request_journal,
         last_reloaded: Arc::new(std::sync::Mutex::new(None)),
+        trace_sampler,
     };
 
     // Create server

@@ -8,6 +8,40 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock as AsyncRwLock;
 
+/// Timing breakdown for a request.
+///
+/// Records key step durations and routing decision context for debugging.
+/// All time values are in milliseconds.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+pub struct RequestTiming {
+    /// Model parsing duration — extract_model + get_available_for_model
+    pub parse_model_ms: u64,
+    /// Provider selection duration — cumulative across all retry rounds
+    pub select_provider_ms: u64,
+    /// Upstream request total duration — cumulative across all attempts
+    /// SSE: from request start to last chunk arriving at proxy
+    /// Non-SSE: complete HTTP round-trip
+    pub upstream_total_ms: u64,
+    /// Upstream time-to-first-byte — final successful attempt's TTFB
+    /// SSE: first chunk from upstream arriving at proxy
+    pub upstream_ttfb_ms: u64,
+    /// Number of failed attempts before success (0 = first attempt succeeded)
+    pub retry_count: u8,
+    /// Provider name for each attempt (successful or failed)
+    /// On success: length = retry_count + 1 (N failed + 1 successful)
+    /// On all-failed: length = retry_count (N failed, no successful attempt)
+    pub retry_providers: Vec<String>,
+    /// Wall-clock duration (ms) for each attempt — same length as retry_providers
+    pub retry_durations_ms: Vec<u64>,
+    /// Number of available candidate providers
+    pub available_providers: u16,
+    /// Routing decision reason — prefixed: pinned:|rule:|strategy:
+    /// Max 128 bytes
+    pub selection_reason: String,
+    /// Whether timing data is complete (false = partial, some fields are default 0)
+    pub completed: bool,
+}
+
 /// A single entry in the request journal.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RequestJournalEntry {
@@ -34,6 +68,16 @@ pub struct RequestJournalEntry {
     pub failover_chain: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timing: Option<RequestTiming>,
+}
+
+/// Timing summary embedded in list view entries.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TimingSummary {
+    pub upstream_total_ms: u64,
+    pub upstream_ttfb_ms: u64,
+    pub completed: bool,
 }
 
 /// Summary of a journal entry for list view (excludes body).
@@ -51,6 +95,8 @@ pub struct RequestJournalSummary {
     pub status: u16,
     pub request_bytes: u64,
     pub response_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timing_summary: Option<TimingSummary>,
 }
 
 impl From<RequestJournalEntry> for RequestJournalSummary {
@@ -68,6 +114,11 @@ impl From<RequestJournalEntry> for RequestJournalSummary {
             status: entry.status,
             request_bytes: entry.request_bytes,
             response_bytes: entry.response_bytes,
+            timing_summary: entry.timing.as_ref().map(|t| TimingSummary {
+                upstream_total_ms: t.upstream_total_ms,
+                upstream_ttfb_ms: t.upstream_ttfb_ms,
+                completed: t.completed,
+            }),
         }
     }
 }
@@ -81,6 +132,8 @@ pub struct JournalQuery {
     pub status: Option<u16>,
     pub path: Option<String>,
     pub date: Option<String>,
+    pub failed_only: bool,
+    pub slow_only: bool,
 }
 
 /// Writer for request journal entries.
@@ -219,6 +272,9 @@ pub async fn list_entries(
     let mut entries: Vec<RequestJournalEntry> = Vec::new();
     
     let date_dirs: Vec<String> = if let Some(ref date) = query.date {
+        if date.contains("..") || date.contains('/') || date.contains('\\') {
+            return Err("Invalid date filter".to_string());
+        }
         vec![date.clone()]
     } else {
         match tokio::fs::read_dir(&base_path).await {
@@ -316,11 +372,36 @@ fn matches_query(entry: &RequestJournalEntry, query: &JournalQuery) -> bool {
             return false;
         }
     }
-    
+
+    if query.failed_only {
+        if entry.timing.as_ref().map_or(true, |t| t.completed) && entry.status < 400 {
+            return false;
+        }
+    }
+
+    if query.slow_only {
+        if !entry.timing.as_ref().map_or(false, |t| t.upstream_total_ms > 3000) {
+            return false;
+        }
+    }
+
     true
 }
 
+/// Validate that an entry ID is safe to use in filesystem paths.
+/// Rejects IDs containing path traversal sequences or path separators.
+fn is_safe_id(id: &str) -> bool {
+    !id.is_empty()
+        && !id.contains("..")
+        && !id.contains('/')
+        && !id.contains('\\')
+        && !id.contains(std::path::MAIN_SEPARATOR)
+}
+
 pub async fn get_entry(storage_dir: &str, id: &str) -> Result<Option<RequestJournalEntry>, String> {
+    if !is_safe_id(id) {
+        return Err(format!("Invalid entry ID: {}", id));
+    }
     let base_path = PathBuf::from(storage_dir);
     
     if !base_path.exists() {
@@ -493,8 +574,9 @@ mod tests {
             response_bytes: 200,
             failover_chain: None,
             error: None,
+            timing: None,
         };
-        
+
         writer.write_entry(entry.clone()).await;
         
         let expected_path = PathBuf::from(&storage_dir)
@@ -546,8 +628,9 @@ mod tests {
             response_bytes: 0,
             failover_chain: None,
             error: None,
+            timing: None,
         };
-        
+
         writer.write_entry(entry).await;
         
         let expected_path = PathBuf::from(&storage_dir)
@@ -556,4 +639,38 @@ mod tests {
         
         assert!(!expected_path.exists(), "Journal file should NOT exist when disabled");
     }
+}
+
+/// Format a timing summary as human-readable text.
+/// Pure `format!()` string concatenation — no LLM calls, no template engine.
+pub fn format_timing_summary(entry: &RequestJournalEntry) -> String {
+    let mut lines = Vec::new();
+    lines.push(format!("Request {} ({} {}):", entry.id, entry.method, entry.path));
+    lines.push(format!("- Model: {}", entry.model));
+    lines.push(format!("- Provider: {} ({})", entry.provider, if entry.streaming { "SSE" } else { "non-SSE" }));
+    lines.push(format!("- Status: {}", entry.status));
+
+    if let Some(ref timing) = entry.timing {
+        lines.push("- Timing breakdown:".to_string());
+        lines.push(format!("  · Parse model: {}ms (available providers: {})", timing.parse_model_ms, timing.available_providers));
+        lines.push(format!("  · Select provider: {}ms (decision: {}, retries: {})", timing.select_provider_ms, timing.selection_reason, timing.retry_count));
+        lines.push(format!("  · Upstream total: {}ms", timing.upstream_total_ms));
+        lines.push(format!("  · Upstream TTFB: {}ms", timing.upstream_ttfb_ms));
+        if !timing.retry_providers.is_empty() {
+            lines.push("  · Attempt breakdown:".to_string());
+            for (i, (prov, dur)) in timing.retry_providers.iter().zip(timing.retry_durations_ms.iter()).enumerate() {
+                let tag = if i < timing.retry_count as usize { "failed" } else { "success" };
+                lines.push(format!("    {}. {}: {}ms ({})", i + 1, prov, dur, tag));
+            }
+        }
+        lines.push(format!("- Data complete: {}", if timing.completed { "yes" } else { "no (partial)" }));
+    } else {
+        lines.push("- Timing: not collected".to_string());
+    }
+
+    if let Some(ref error) = entry.error {
+        lines.push(format!("- Error: {}", error));
+    }
+
+    lines.join("\n")
 }

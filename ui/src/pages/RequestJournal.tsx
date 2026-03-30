@@ -2,8 +2,6 @@ import { useState, useEffect, useMemo } from "react";
 import {
   Search,
   Filter,
-  ChevronDown,
-  ChevronRight,
   Download,
   Copy,
   ExternalLink,
@@ -25,10 +23,73 @@ import type {
   RequestJournalEntry,
   RequestJournalSummary,
   RequestJournalQuery,
+  RequestTiming,
 } from "@/api/types";
-import { cn } from "@/lib/utils";
 import { toast } from "sonner";
 import { AlertCircle } from "lucide-react";
+
+function TimingBreakdown({ timing }: { timing: RequestTiming }) {
+  const hasRetries = timing.retry_count > 0;
+
+  return (
+    <div className="text-sm space-y-2">
+      <div className="flex items-center gap-2">
+        <span className="text-muted-foreground">Timing Breakdown</span>
+        {!timing.completed && (
+          <Badge variant="warning" className="text-[10px]">Incomplete</Badge>
+        )}
+      </div>
+      <div className="bg-muted/50 rounded p-2 space-y-1.5">
+        <div className="flex justify-between text-xs">
+          <span className="text-muted-foreground">Model Parsing</span>
+          <span className="font-mono">{timing.parse_model_ms} ms</span>
+        </div>
+        <div className="flex justify-between text-xs">
+          <span className="text-muted-foreground">Provider Selection</span>
+          <span className="font-mono">{timing.select_provider_ms} ms</span>
+        </div>
+        <div className="flex justify-between text-xs">
+          <span className="text-muted-foreground">Upstream Total</span>
+          <span className="font-mono font-medium">{timing.upstream_total_ms} ms</span>
+        </div>
+        <div className="flex justify-between text-xs">
+          <span className="text-muted-foreground">Upstream TTFB</span>
+          <span className="font-mono">{timing.upstream_ttfb_ms} ms</span>
+        </div>
+        <div className="flex justify-between text-xs">
+          <span className="text-muted-foreground">Available Providers</span>
+          <span className="font-mono">{timing.available_providers}</span>
+        </div>
+        <div className="flex justify-between text-xs">
+          <span className="text-muted-foreground">Selection Reason</span>
+          <Badge variant="outline" className="text-[10px] font-mono">
+            {timing.selection_reason}
+          </Badge>
+        </div>
+        {hasRetries && (
+          <div className="pt-1 border-t">
+            <div className="text-xs text-muted-foreground mb-1">
+              Retry Breakdown ({timing.retry_count} retries)
+            </div>
+            {timing.retry_providers.map((prov, i) => {
+              const duration = timing.retry_durations_ms[i];
+              if (duration === undefined) return null;
+              return (
+                <div key={i} className="flex justify-between text-xs pl-2">
+                  <span className="font-mono">
+                    {i + 1}. {prov}
+                    {i < timing.retry_count ? " (failed)" : " (success)"}
+                  </span>
+                  <span className="font-mono">{duration} ms</span>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
 
 function RequestDetailModal({
   entry,
@@ -108,6 +169,19 @@ function RequestDetailModal({
               </div>
             </div>
           </div>
+
+          {entry.timing && (
+            <TimingBreakdown timing={entry.timing} />
+          )}
+
+          {!entry.timing && (
+            <div className="text-sm">
+              <span className="text-muted-foreground">Timing Breakdown</span>
+              <div className="mt-0.5 text-xs text-muted-foreground italic">
+                Not collected
+              </div>
+            </div>
+          )}
 
           {entry.upstream_url && (
             <div className="text-sm">
@@ -393,20 +467,21 @@ storage_dir = "logs/request-journal"`}
             </div>
           ) : (
             <div className="rounded-md border flex-1 overflow-y-auto min-h-0">
-              <div className="grid grid-cols-[90px_80px_100px_100px_1fr_60px_70px] gap-2 px-3 py-2 border-b bg-muted/50 text-xs font-medium text-muted-foreground sticky top-0 z-10">
+              <div className="grid grid-cols-[90px_80px_100px_100px_1fr_60px_60px_70px] gap-2 px-3 py-2 border-b bg-muted/50 text-xs font-medium text-muted-foreground sticky top-0 z-10">
                 <span>Time</span>
                 <span>Client</span>
                 <span>Provider</span>
                 <span>Model</span>
                 <span>Path</span>
                 <span className="text-right">Status</span>
+                <span className="text-right">Latency</span>
                 <span className="text-right">Size</span>
               </div>
 
               {entries.map((entry) => (
                 <div
                   key={entry.id}
-                  className="grid grid-cols-[90px_80px_100px_100px_1fr_60px_70px] gap-2 px-3 py-2 border-b text-sm items-center cursor-pointer hover:bg-accent/30 transition-colors"
+                  className="grid grid-cols-[90px_80px_100px_100px_1fr_60px_60px_70px] gap-2 px-3 py-2 border-b text-sm items-center cursor-pointer hover:bg-accent/30 transition-colors"
                   onClick={() => handleRowClick(entry)}
                 >
                   <span className="font-mono text-xs text-muted-foreground">
@@ -432,6 +507,25 @@ storage_dir = "logs/request-journal"`}
                   >
                     {entry.status}
                   </Badge>
+                  {entry.timing_summary ? (
+                    <Badge
+                      variant={
+                        entry.timing_summary.upstream_total_ms > 3000
+                          ? "danger"
+                          : entry.timing_summary.upstream_total_ms > 1000
+                            ? "warning"
+                            : "success"
+                      }
+                      className="text-[10px] justify-center"
+                    >
+                      {entry.timing_summary.upstream_total_ms > 1000
+                        ? `${(entry.timing_summary.upstream_total_ms / 1000).toFixed(1)}s`
+                        : `${entry.timing_summary.upstream_total_ms}ms`}
+                      {!entry.timing_summary.completed && " \u26A0"}
+                    </Badge>
+                  ) : (
+                    <span className="text-xs text-muted-foreground text-right">-</span>
+                  )}
                   <span className="font-mono text-xs text-right text-muted-foreground">
                     {(entry.request_bytes / 1024).toFixed(0)}K
                   </span>

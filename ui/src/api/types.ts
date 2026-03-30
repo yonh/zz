@@ -154,6 +154,19 @@ export interface TrafficEntry {
   color: string;
 }
 
+export interface RequestTiming {
+  parse_model_ms: number;
+  select_provider_ms: number;
+  upstream_total_ms: number;
+  upstream_ttfb_ms: number;
+  retry_count: number;
+  retry_providers: string[];
+  retry_durations_ms: number[];
+  available_providers: number;
+  selection_reason: string;
+  completed: boolean;
+}
+
 export interface RequestJournalEntry {
   id: string;
   timestamp: string;
@@ -174,6 +187,7 @@ export interface RequestJournalEntry {
   response_bytes: number;
   failover_chain?: string[];
   error?: string;
+  timing?: RequestTiming;
 }
 
 export interface RequestJournalSummary {
@@ -189,6 +203,11 @@ export interface RequestJournalSummary {
   status: number;
   request_bytes: number;
   response_bytes: number;
+  timing_summary?: {
+    upstream_total_ms: number;
+    upstream_ttfb_ms: number;
+    completed: boolean;
+  };
 }
 
 export interface RequestJournalStatus {

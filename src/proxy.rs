@@ -3,6 +3,7 @@ use std::sync::Arc;
 use http_body_util::{BodyExt, Full, combinators::BoxBody, StreamBody};
 use hyper::body::{Bytes, Frame, Incoming};
 use std::collections::HashSet;
+use tracing::Instrument;
 use futures_util::TryStreamExt;
 
 type ResponseBody = BoxBody<Bytes, hyper::Error>;
@@ -35,26 +36,39 @@ pub async fn proxy_handler(
     let request_id = generate_request_id();
     let proxy_start = std::time::Instant::now();
     let request_bytes = body_bytes.len() as u64;
+
+    // Read config once for timing toggle, max_retries, and request_timeout
+    let (timing_enabled, max_retries, request_timeout_secs) = {
+        let config = state.config.read().unwrap();
+        (
+            config.observability.timing.enabled,
+            config.routing.max_retries,
+            config.server.request_timeout_secs,
+        )
+    };
+
+    // Timing state
+    let mut timing = if timing_enabled {
+        Some(crate::request_journal::RequestTiming::default())
+    } else {
+        None
+    };
+
+    // Root tracing span — wraps the entire request body so that
+    // #[instrument] child spans parent to it correctly.
+    let root_span = tracing::info_span!(
+        "proxy_handler",
+        request_id = %request_id,
+        method = %method,
+        path = %path,
+    );
+
+    // Use .instrument() to enter the span for the async body.
+    // This is the async-safe equivalent of root_span.enter().
+    async move {
+    // 1. Model parsing + pre-filter timing
+    let t_parse = std::time::Instant::now();
     let model = extract_model(&body_bytes);
-    let mut failover_chain: Vec<String> = Vec::new();
-    let mut final_provider = String::new();
-    let mut final_upstream_url = String::new();
-    let mut final_status: u16 = 503;
-    let mut response_bytes: u64 = 0;
-    let mut ttfb_ms: u64 = 0;
-
-    let max_retries = {
-        let config = state.config.read().unwrap();
-        config.routing.max_retries
-    };
-    let request_timeout_secs = {
-        let config = state.config.read().unwrap();
-        config.server.request_timeout_secs
-    };
-    let mut tried_providers: HashSet<String> = HashSet::new();
-    let mut last_error: Option<crate::error::ProxyError> = None;
-
-    // Pre-filter providers by model support
     let base_providers: Vec<_> = if model != "unknown" {
         let model_providers = state.provider_manager.get_available_for_model(&model);
         if model_providers.is_empty() {
@@ -66,6 +80,12 @@ pub async fn proxy_handler(
 
             if !has_support {
                 tracing::warn!(model = %model, "No provider configured to support this model");
+                // Finalize timing for early exit
+                if let Some(ref mut t) = timing {
+                    t.parse_model_ms = t_parse.elapsed().as_millis() as u64;
+                    t.available_providers = 0;
+                    t.completed = false;
+                }
                 let error_body = serde_json::json!({
                     "error": {
                         "type": "invalid_request_error",
@@ -88,6 +108,26 @@ pub async fn proxy_handler(
         state.provider_manager.get_available()
     };
 
+    if let Some(ref mut t) = timing {
+        t.parse_model_ms = t_parse.elapsed().as_millis() as u64;
+        t.available_providers = base_providers.len() as u16;
+    }
+
+    let mut failover_chain: Vec<String> = Vec::new();
+    let mut final_provider = String::new();
+    let mut final_upstream_url = String::new();
+    let mut final_status: u16 = 503;
+    let mut response_bytes: u64 = 0;
+    let mut ttfb_ms: u64 = 0;
+
+    let mut tried_providers: HashSet<String> = HashSet::new();
+    let mut last_error: Option<crate::error::ProxyError> = None;
+
+    // Cumulative timing across retries
+    let mut total_select_ms: u64 = 0;
+    let mut total_upstream_ms: u64 = 0;
+    let mut retry_count: u8 = 0;
+
     for _ in 0..max_retries {
         // Get providers (excluding already tried ones)
         let providers: Vec<_> = base_providers.iter()
@@ -99,13 +139,14 @@ pub async fn proxy_handler(
             break;
         }
 
-        // Select provider: priority is model_pins > model_rules > routing_strategy
-        let (provider_name, provider, is_pinned) = {
+        // 2. Provider selection timing
+        let t_select = std::time::Instant::now();
+        let sel = {
             // 1. Check model pinning (highest priority)
             if let Some(pinned_provider_name) = state.model_pins.get(&model) {
                 let pinned_name = pinned_provider_name.value().clone();
                 drop(pinned_provider_name);
-                
+
                 match state.provider_manager.get_by_name(&pinned_name) {
                     Some(p) if p.is_available() => {
                         tracing::info!(
@@ -113,7 +154,12 @@ pub async fn proxy_handler(
                             pinned_provider = %pinned_name,
                             "Using pinned provider for model"
                         );
-                        (pinned_name, Arc::clone(&p), true)
+                        ProviderSelection {
+                            provider_name: pinned_name.clone(),
+                            provider: Arc::clone(&p),
+                            is_pinned: true,
+                            selection_reason: format!("pinned:{}", pinned_name),
+                        }
                     }
                     Some(_) => {
                         // Pinned provider exists but is unavailable (disabled/unhealthy)
@@ -121,6 +167,31 @@ pub async fn proxy_handler(
                             model = %model,
                             pinned_provider = %pinned_name,
                             "Pinned provider is unavailable, returning 503"
+                        );
+                        // Finalize timing for pinned-unavailable path
+                        if let Some(ref mut t) = timing {
+                            t.selection_reason = format!("pinned:{}", pinned_name);
+                            t.completed = false;
+                        }
+                        write_request_journal(
+                            &state,
+                            JournalParams {
+                                request_id: request_id.clone(),
+                                headers: &headers,
+                                body_bytes: &body_bytes,
+                                method: &method,
+                                path: &path,
+                                provider: pinned_name.clone(),
+                                upstream_url: String::new(),
+                                model: model.clone(),
+                                streaming: is_sse,
+                                status: 503,
+                                request_bytes,
+                                response_bytes: 0,
+                                failover_chain: None,
+                                error: Some(format!("Pinned provider '{}' for model '{}' is unavailable", pinned_name, model)),
+                                timing,
+                            },
                         );
                         return Err(crate::error::ProxyError::ProviderError(format!(
                             "Pinned provider '{}' for model '{}' is unavailable",
@@ -135,9 +206,8 @@ pub async fn proxy_handler(
                             "Pinned provider deleted, removing pin"
                         );
                         state.model_pins.remove(&model);
-                        // Fall through to normal routing
                         match select_provider_normal(&model, &providers, &state) {
-                            Some(p) => (p.0, p.1, false),
+                            Some(s) => s,
                             None => break,
                         }
                     }
@@ -145,11 +215,24 @@ pub async fn proxy_handler(
             } else {
                 // No pin, use normal routing
                 match select_provider_normal(&model, &providers, &state) {
-                    Some(p) => (p.0, p.1, false),
+                    Some(s) => s,
                     None => break,
                 }
             }
         };
+        total_select_ms += t_select.elapsed().as_millis() as u64;
+
+        // Record selection reason
+        if let Some(ref mut t) = timing {
+            t.selection_reason = sel.selection_reason.clone();
+            if t.selection_reason.len() > 128 {
+                t.selection_reason.truncate(128);
+            }
+        }
+
+        let provider_name = sel.provider_name;
+        let provider = sel.provider;
+        let is_pinned = sel.is_pinned;
 
         tried_providers.insert(provider_name.clone());
 
@@ -164,6 +247,9 @@ pub async fn proxy_handler(
         // Increment request counter
         state.provider_manager.increment_request(&provider_name);
 
+        // 3. Upstream request timing
+        let t_attempt = std::time::Instant::now();
+
         // Attempt request with this provider
         match attempt_request(
             &provider_name,
@@ -177,6 +263,8 @@ pub async fn proxy_handler(
             request_timeout_secs,
         ).await {
             Ok((response, resp_bytes, resp_ttfb_ms, token_usage, upstream_url)) => {
+                let attempt_ms = t_attempt.elapsed().as_millis() as u64;
+                total_upstream_ms += attempt_ms;
                 let status_code = response.status().as_u16();
                 failover_chain.push(format!("{}:{}", provider_name, status_code));
                 final_provider = provider_name.clone();
@@ -194,6 +282,17 @@ pub async fn proxy_handler(
                         usage.prompt_tokens,
                         usage.completion_tokens,
                     );
+                }
+
+                // Finalize timing
+                if let Some(ref mut t) = timing {
+                    t.select_provider_ms = total_select_ms;
+                    t.upstream_total_ms = total_upstream_ms;
+                    t.upstream_ttfb_ms = resp_ttfb_ms;
+                    t.retry_count = retry_count;
+                    t.retry_providers.push(provider_name.clone());
+                    t.retry_durations_ms.push(attempt_ms);
+                    t.completed = true;
                 }
 
                 let log_entry = crate::stats::LogEntry {
@@ -222,67 +321,98 @@ pub async fn proxy_handler(
 
                 write_request_journal(
                     &state,
-                    request_id.clone(),
-                    &headers,
-                    &body_bytes,
-                    &method,
-                    &path,
-                    &final_provider,
-                    &final_upstream_url,
-                    &model,
-                    is_sse,
-                    final_status,
-                    request_bytes,
-                    response_bytes,
-                    if failover_chain.len() > 1 { Some(failover_chain.clone()) } else { None },
-                    None,
+                    JournalParams {
+                        request_id: request_id.clone(),
+                        headers: &headers,
+                        body_bytes: &body_bytes,
+                        method: &method,
+                        path: &path,
+                        provider: final_provider.clone(),
+                        upstream_url: final_upstream_url.clone(),
+                        model: model.clone(),
+                        streaming: is_sse,
+                        status: final_status,
+                        request_bytes,
+                        response_bytes,
+                        failover_chain: if failover_chain.len() > 1 { Some(failover_chain.clone()) } else { None },
+                        error: None,
+                        timing,
+                    },
                 );
 
                 return Ok(response);
             }
             Err(e) => {
+                let attempt_ms = t_attempt.elapsed().as_millis() as u64;
+                total_upstream_ms += attempt_ms;
+
                 failover_chain.push(format!("{}:err", provider_name));
                 final_provider = provider_name.clone();
-                
+
+                // Record failed attempt in timing
+                if let Some(ref mut t) = timing {
+                    t.retry_providers.push(provider_name.clone());
+                    t.retry_durations_ms.push(attempt_ms);
+                }
+
                 if is_pinned {
                     tracing::error!(
                         provider = %provider_name,
                         error = %e,
                         "Pinned provider failed, returning error without retry"
                     );
-                    
+
+                    // Finalize timing for pinned failure
+                    if let Some(ref mut t) = timing {
+                        t.select_provider_ms = total_select_ms;
+                        t.upstream_total_ms = total_upstream_ms;
+                        t.retry_count = retry_count;
+                        t.completed = false;
+                    }
+
                     write_request_journal(
                         &state,
-                        request_id,
-                        &headers,
-                        &body_bytes,
-                        &method,
-                        &path,
-                        &final_provider,
-                        "",
-                        &model,
-                        is_sse,
-                        503,
-                        request_bytes,
-                        0,
-                        if failover_chain.len() > 1 { Some(failover_chain) } else { None },
-                        Some(e.to_string()),
+                        JournalParams {
+                            request_id,
+                            headers: &headers,
+                            body_bytes: &body_bytes,
+                            method: &method,
+                            path: &path,
+                            provider: final_provider.clone(),
+                            upstream_url: String::new(),
+                            model,
+                            streaming: is_sse,
+                            status: 503,
+                            request_bytes,
+                            response_bytes: 0,
+                            failover_chain: if failover_chain.len() > 1 { Some(failover_chain) } else { None },
+                            error: Some(e.to_string()),
+                            timing,
+                        },
                     );
-                    
+
                     return Err(e);
                 }
-                
+
                 tracing::warn!(
                     provider = %provider_name,
                     error = %e,
                     "Request failed, will try next provider"
                 );
+                retry_count += 1;
                 last_error = Some(e);
             }
         }
     }
 
-    // All providers failed
+    // All providers failed — finalize timing
+    if let Some(ref mut t) = timing {
+        t.select_provider_ms = total_select_ms;
+        t.upstream_total_ms = total_upstream_ms;
+        t.retry_count = retry_count;
+        t.completed = false;
+    }
+
     let error_msg = last_error
         .map(|e| format!("All providers failed. Last error: {}", e))
         .unwrap_or_else(|| "No available providers".to_string());
@@ -310,32 +440,39 @@ pub async fn proxy_handler(
 
     write_request_journal(
         &state,
-        request_id,
-        &headers,
-        &body_bytes,
-        &method,
-        &path,
-        &final_provider,
-        &final_upstream_url,
-        &model,
-        is_sse,
-        503,
-        request_bytes,
-        0,
-        if failover_chain.len() > 1 { Some(failover_chain) } else { None },
-        Some(error_msg.clone()),
+        JournalParams {
+            request_id,
+            headers: &headers,
+            body_bytes: &body_bytes,
+            method: &method,
+            path: &path,
+            provider: final_provider.clone(),
+            upstream_url: final_upstream_url.clone(),
+            model,
+            streaming: is_sse,
+            status: 503,
+            request_bytes,
+            response_bytes: 0,
+            failover_chain: if failover_chain.len() > 1 { Some(failover_chain) } else { None },
+            error: Some(error_msg.clone()),
+            timing,
+        },
     );
 
     Ok(hyper::Response::builder()
         .status(hyper::StatusCode::SERVICE_UNAVAILABLE)
         .body(full(error_msg))
         .unwrap())
+    }
+    .instrument(root_span)
+    .await
 }
 
 fn is_sse_request(req: &hyper::Request<Incoming>) -> bool {
     crate::stream::is_sse_request(req)
 }
 
+#[tracing::instrument(name = "attempt_request", skip(provider, headers, body_bytes, state), fields(provider = %provider_name))]
 async fn attempt_request(
     provider_name: &str,
     provider: &Arc<crate::provider::Provider>,
@@ -518,6 +655,7 @@ pub struct AppState {
     pub rpm_counter: Arc<crate::stats::RpmCounter>,
     pub request_journal: Arc<crate::request_journal::RequestJournalWriter>,
     pub last_reloaded: Arc<std::sync::Mutex<Option<String>>>,
+    pub trace_sampler: Option<Arc<crate::trace_layer::TraceSampler>>,
 }
 
 impl AppState {
@@ -539,9 +677,14 @@ impl AppState {
         *self.model_rules.write().unwrap() = new_rules;
 
         let journal_config = new_config.observability.request_journal.clone();
+        let new_tracing_config = new_config.observability.tracing.clone();
         *self.config.write().unwrap() = new_config;
-        
+
         self.request_journal.update_config(journal_config);
+
+        if let Some(sampler) = &self.trace_sampler {
+            sampler.update_config(new_tracing_config);
+        }
         
         let now = chrono::Utc::now().to_rfc3339();
         *self.last_reloaded.lock().unwrap() = Some(now);
@@ -560,33 +703,57 @@ enum SelectResult {
     NoRule,
 }
 
-/// Select a provider using model rules; returns SelectResult so the caller can
-/// distinguish between "rule matched but target unavailable" and "no rule".
-/// Normal provider selection (rules + strategy) without pinning
-/// Returns None if rule matched but target is unavailable (should stop retry)
+/// Provider selection result including the routing decision reason.
+struct ProviderSelection {
+    provider_name: String,
+    provider: Arc<crate::provider::Provider>,
+    is_pinned: bool,
+    /// Routing decision reason — prefixed: pinned:|rule:|strategy:
+    selection_reason: String,
+}
+
+/// Normal provider selection (rules + strategy) without pinning.
+/// Returns None if rule matched but target is unavailable (should stop retry).
+#[tracing::instrument(name = "select_provider_normal", skip(providers, state), fields(model = %model))]
 fn select_provider_normal(
     model: &str,
     providers: &[(String, Arc<crate::provider::Provider>)],
     state: &AppState,
-) -> Option<(String, Arc<crate::provider::Provider>)> {
+) -> Option<ProviderSelection> {
     let rules = state.model_rules.read().unwrap();
     tracing::debug!(
         model = %model,
         rules_count = rules.len(),
         "Selecting provider for model"
     );
-    match select_with_rules(model, providers, &rules, &state.router) {
-        SelectResult::Provider(p) => Some(p),
+    match select_with_rules(model, providers, &rules) {
+        SelectResult::Provider((name, p)) => {
+            let reason = format!("rule:{}", name);
+            Some(ProviderSelection {
+                provider_name: name,
+                provider: p,
+                is_pinned: false,
+                selection_reason: reason,
+            })
+        }
         SelectResult::RuleMatchedButUnavailable(target) => {
             tracing::warn!(
                 model = %model,
                 target_provider = %target,
                 "Model rule matched but target provider is unavailable, stopping retry"
             );
-            None  // Signal caller to break retry loop
+            None
         }
         SelectResult::NoRule => {
-            state.router.select_provider(providers)
+            let strategy = state.config.read().unwrap().routing.strategy.clone();
+            state.router.select_provider(providers).map(|(name, p)| {
+                ProviderSelection {
+                    provider_name: name,
+                    provider: p,
+                    is_pinned: false,
+                    selection_reason: format!("strategy:{}", strategy),
+                }
+            })
         }
     }
 }
@@ -595,7 +762,6 @@ fn select_with_rules(
     model: &str,
     providers: &[(String, Arc<crate::provider::Provider>)],
     rules: &[crate::router::ModelRule],
-    router: &crate::router::Router,
 ) -> SelectResult {
     for rule in rules {
         if crate::router::glob_match_pub(&rule.pattern, model) {
@@ -615,6 +781,7 @@ fn select_with_rules(
 }
 
 
+#[tracing::instrument(name = "extract_model", skip(body))]
 fn extract_model(body: &[u8]) -> String {
     // Try to parse as UTF-8 first
     let Ok(s) = std::str::from_utf8(body) else {
@@ -805,66 +972,74 @@ fn extract_usage_details(usage: &serde_json::Value) -> Option<serde_json::Value>
     }
 }
 
-fn write_request_journal(
-    state: &AppState,
+/// Parameters for writing a request journal entry, grouping the many fields
+/// into a single struct to keep the function signature manageable.
+struct JournalParams<'a> {
     request_id: String,
-    headers: &hyper::HeaderMap,
-    body_bytes: &Bytes,
-    method: &hyper::Method,
-    path: &str,
-    provider: &str,
-    upstream_url: &str,
-    model: &str,
+    headers: &'a hyper::HeaderMap,
+    body_bytes: &'a Bytes,
+    method: &'a hyper::Method,
+    path: &'a str,
+    provider: String,
+    upstream_url: String,
+    model: String,
     streaming: bool,
     status: u16,
     request_bytes: u64,
     response_bytes: u64,
     failover_chain: Option<Vec<String>>,
     error: Option<String>,
+    timing: Option<crate::request_journal::RequestTiming>,
+}
+
+fn write_request_journal(
+    state: &AppState,
+    params: JournalParams<'_>,
 ) {
     if !state.request_journal.is_enabled() {
         return;
     }
 
-    let user_agent = headers
+    let user_agent = params.headers
         .get(hyper::header::USER_AGENT)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
     let client_name = crate::request_journal::infer_client_name(user_agent);
-    let request_headers = state.request_journal.redact_headers(headers);
+    let request_headers = state.request_journal.redact_headers(params.headers);
 
-    let content_type = headers
+    let content_type = params.headers
         .get(hyper::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    let (request_body_text, request_body_base64) = if let Ok(text) = std::str::from_utf8(body_bytes) {
+    let (request_body_text, request_body_base64) = if let Ok(text) = std::str::from_utf8(params.body_bytes) {
         (Some(text.to_string()), None)
     } else {
-        (None, Some(base64::Engine::encode(&base64::engine::general_purpose::STANDARD, body_bytes)))
+        (None, Some(base64::Engine::encode(&base64::engine::general_purpose::STANDARD, params.body_bytes)))
     };
 
     let entry = crate::request_journal::RequestJournalEntry {
-        id: request_id,
+        id: params.request_id,
         timestamp: chrono::Utc::now().to_rfc3339(),
         client_name,
         user_agent: user_agent.to_string(),
-        method: method.to_string(),
-        path: path.to_string(),
-        provider: provider.to_string(),
-        upstream_url: upstream_url.to_string(),
-        model: model.to_string(),
-        streaming,
-        status,
+        method: params.method.to_string(),
+        path: params.path.to_string(),
+        provider: params.provider,
+        upstream_url: params.upstream_url,
+        model: params.model,
+        streaming: params.streaming,
+        status: params.status,
         request_headers,
         request_content_type: content_type.to_string(),
         request_body_text,
         request_body_base64,
-        request_bytes,
-        response_bytes,
-        failover_chain,
-        error,
+        request_bytes: params.request_bytes,
+        response_bytes: params.response_bytes,
+        failover_chain: params.failover_chain,
+        error: params.error,
+        timing: params.timing,
     };
 
     let journal = state.request_journal.clone();
