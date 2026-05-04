@@ -21,6 +21,10 @@ export default defineConfig({
         target: "ws://127.0.0.1:9090",
         ws: true,
       },
+      "/v1": {
+        target: "http://127.0.0.1:9090",
+        changeOrigin: true,
+      },
     },
   },
 })

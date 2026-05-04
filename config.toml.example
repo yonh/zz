@@ -1,10 +1,20 @@
+# ZZ LLM API Reverse Proxy - Example Configuration
+# Copy this file to config.toml and fill in your API keys.
+
 [server]
 listen = "127.0.0.1:9090"
 request_timeout_secs = 300
 log_level = "info"
 
+[admin]
+# Admin API authentication.
+# When enabled, all /zz/api/* endpoints (except health/version) require auth.
+enabled = false
+api_key = ""               # Set a secret key, e.g. "my-admin-secret"
+allowed_origins = ["http://localhost:5173", "http://localhost:3000"]
+
 [routing]
-strategy = "failover"
+strategy = "round-robin"   # "failover" | "round-robin" | "weighted-random"
 retry_on_failure = true
 max_retries = 3
 
@@ -13,22 +23,49 @@ failure_threshold = 3
 recovery_secs = 600
 cooldown_secs = 60
 
+# --- Observability ---
+
+[observability.timing]
+# Tier 1: Key timing fields in request journal entries.
+# Zero overhead (<200ns per request). Recommended: keep enabled.
+enabled = true
+
+[observability.request_journal]
+# Persistent request forensics — stores full request/response data per entry.
+enabled = true
+storage_dir = "logs/request-journal"
+retention_days = 7
+redact_headers = ["authorization", "x-api-key", "cookie", "set-cookie"]
+# Capture upstream response body for debugging (shows what the remote API returned).
+capture_response_body = true
+# Max bytes of response body to store per entry (default 10KB).
+# max_response_body_bytes = 10240
+
+[observability.tracing]
+# Tier 2: Function-level tracing via custom tracing Layer.
+# Disabled by default — enable when you need deep call-chain debugging.
+enabled = false
+sampling_mode = "adaptive"   # "fixed" | "adaptive"
+base_rate = 0.01             # Normal request sampling rate (1%)
+slow_threshold_ms = 3000     # Requests slower than this are always sampled
+error_sampling = 1.0         # Error request sampling rate (100%)
+storage_dir = "logs/traces"
+retention_days = 3
+
+# --- Providers ---
+
 [[providers]]
-name = "ali-account-1"
-base_url = "https://dashscope.aliyuncs.com/compatible-mode"
-api_key = "sk-xxxx"
+name = "example-provider"
+base_url = "https://api.example.com/v1"
+api_key = "sk-your-api-key-here"
 priority = 1
-models = ["qwen-plus", "qwen-turbo"]
+weight = 1
+models = ["gpt-4", "gpt-3.5-turbo"]
 
-[[providers]]
-name = "zhipu-account-1"
-base_url = "https://open.bigmodel.cn/api/paas/v4"
-api_key = "sk-yyyy"
-priority = 2
-models = ["glm-4", "glm-4-flash"]
-
-[[providers]]
-name = "ali-account-2"
-base_url = "https://dashscope.aliyuncs.com/compatible-mode"
-api_key = "sk-zzzz"
-priority = 3
+# [[providers]]
+# name = "second-provider"
+# base_url = "https://api.another.com/v1"
+# api_key = "sk-another-key"
+# priority = 2
+# weight = 1
+# models = ["claude-3-opus", "claude-3-sonnet"]

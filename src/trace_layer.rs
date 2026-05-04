@@ -397,6 +397,56 @@ async fn write_trace(
 // Query function
 // ---------------------------------------------------------------------------
 
+/// Delete date directories older than `retention_days` from the trace storage.
+/// Returns the list of deleted date directory names.
+pub async fn cleanup_expired(storage_dir: &str, retention_days: u64) -> Vec<String> {
+    if retention_days == 0 || !std::path::Path::new(storage_dir).exists() {
+        return Vec::new();
+    }
+
+    let cutoff = chrono::Utc::now() - chrono::Duration::days(retention_days as i64);
+    let cutoff_str = cutoff.format("%Y-%m-%d").to_string();
+
+    let mut deleted = Vec::new();
+    let mut date_dirs = match tokio::fs::read_dir(storage_dir).await {
+        Ok(dirs) => dirs,
+        Err(_) => return deleted,
+    };
+
+    while let Ok(Some(entry)) = date_dirs.next_entry().await {
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let name = match entry.file_name().to_str() {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+        if name.len() != 10 || !name.contains('-') {
+            continue;
+        }
+        if name.as_str() < cutoff_str.as_str() {
+            match tokio::fs::remove_dir_all(entry.path()).await {
+                Ok(_) => {
+                    tracing::info!(
+                        dir = %name,
+                        "Cleaned up expired trace directory"
+                    );
+                    deleted.push(name);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        dir = %name,
+                        error = %e,
+                        "Failed to remove expired trace directory"
+                    );
+                }
+            }
+        }
+    }
+
+    deleted
+}
+
 pub async fn get_trace(storage_dir: &str, trace_id: &str) -> Option<TraceRecord> {
     // Reject path traversal attempts in trace_id
     if trace_id.contains("..") || trace_id.contains('/') || trace_id.contains('\\') {

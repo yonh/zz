@@ -92,6 +92,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ));
     let start_time = Instant::now();
 
+    // Create shared HTTP client with connection pool for TLS reuse
+    let https = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_native_roots()
+        .unwrap()
+        .https_only()
+        .enable_http1()
+        .build();
+
+    let http_client: proxy::HttpClient = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+        .pool_max_idle_per_host(10)
+        .pool_idle_timeout(std::time::Duration::from_secs(60))
+        .build(https);
+
     let state = proxy::AppState {
         provider_manager,
         router,
@@ -106,6 +119,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         request_journal,
         last_reloaded: Arc::new(std::sync::Mutex::new(None)),
         trace_sampler,
+        http_client,
     };
 
     // Create server
@@ -148,6 +162,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     _ = shutdown_rx_clone.recv() => {
                         tracing::debug!("Stats broadcaster shutting down");
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    // Spawn periodic cleanup task for expired journal and trace data (every hour)
+    {
+        let state_clone = state.clone();
+        let mut shutdown_rx_clone = shutdown_rx.resubscribe();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        // Extract config values and drop the lock before .await
+                        let (journal_cfg, tracing_cfg) = {
+                            let config = state_clone.config.read().unwrap();
+                            (
+                                config.observability.request_journal.clone(),
+                                config.observability.tracing.clone(),
+                            )
+                        };
+
+                        // Cleanup request journal
+                        if journal_cfg.enabled {
+                            let deleted = crate::request_journal::cleanup_expired(
+                                &journal_cfg.storage_dir,
+                                journal_cfg.retention_days,
+                            )
+                            .await;
+                            if !deleted.is_empty() {
+                                state_clone
+                                    .request_journal
+                                    .invalidate_index_dates(&deleted)
+                                    .await;
+                            }
+                        }
+
+                        // Cleanup traces
+                        if tracing_cfg.enabled {
+                            crate::trace_layer::cleanup_expired(
+                                &tracing_cfg.storage_dir,
+                                tracing_cfg.retention_days,
+                            )
+                            .await;
+                        }
+                    }
+                    _ = shutdown_rx_clone.recv() => {
+                        tracing::debug!("Cleanup task shutting down");
                         break;
                     }
                 }

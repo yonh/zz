@@ -5,8 +5,74 @@ use hyper::body::{Bytes, Frame, Incoming};
 use std::collections::HashSet;
 use tracing::Instrument;
 use futures_util::TryStreamExt;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 type ResponseBody = BoxBody<Bytes, hyper::Error>;
+
+/// Wrapper body that fires an `on_drop` callback when the SSE stream completes.
+///
+/// When hyper finishes streaming the response body to the client, this wrapper
+/// is dropped. The drop handler spawns a task to finalize the journal entry with
+/// the actual stream duration and total bytes.
+struct SseStreamGuard<B> {
+    inner: B,
+    on_drop: std::sync::Mutex<Option<Box<dyn FnOnce(u64, Vec<u8>) + Send>>>,
+    total_bytes: Arc<std::sync::atomic::AtomicU64>,
+    /// Buffer accumulated from SSE chunks, capped at SSE_BODY_CAPTURE_CAP.
+    body_buffer: Arc<std::sync::Mutex<Vec<u8>>>,
+}
+
+/// Maximum bytes of SSE response body to capture for journal inspection.
+const SSE_BODY_CAPTURE_CAP: usize = 4096;
+
+impl<B> SseStreamGuard<B> {
+    fn new(
+        inner: B,
+        total_bytes: Arc<std::sync::atomic::AtomicU64>,
+        body_buffer: Arc<std::sync::Mutex<Vec<u8>>>,
+        on_drop: Box<dyn FnOnce(u64, Vec<u8>) + Send>,
+    ) -> Self {
+        Self {
+            inner,
+            on_drop: std::sync::Mutex::new(Some(on_drop)),
+            total_bytes,
+            body_buffer,
+        }
+    }
+}
+
+impl<B> Drop for SseStreamGuard<B> {
+    fn drop(&mut self) {
+        let bytes = self.total_bytes.load(std::sync::atomic::Ordering::Relaxed);
+        let body = std::mem::take(&mut *self.body_buffer.lock().unwrap());
+        if let Some(callback) = self.on_drop.lock().unwrap().take() {
+            callback(bytes, body);
+        }
+    }
+}
+
+impl<B> hyper::body::Body for SseStreamGuard<B>
+where
+    B: hyper::body::Body<Data = Bytes, Error = hyper::Error> + Unpin,
+{
+    type Data = Bytes;
+    type Error = hyper::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        // SAFETY: we never move `inner` out; we only re-pin the projection.
+        let this = self.get_mut();
+        Pin::new(&mut this.inner).poll_frame(cx)
+    }
+}
+
+pub type HttpClient = hyper_util::client::legacy::Client<
+    hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
+    http_body_util::combinators::BoxBody<Bytes, hyper::Error>,
+>;
 
 fn full<T: Into<Bytes>>(chunk: T) -> ResponseBody {
     Full::new(chunk.into())
@@ -21,16 +87,18 @@ pub async fn proxy_handler(
     let path = req.uri().path().to_string();
     let method = req.method().clone();
 
-    // Detect SSE request
-    let is_sse = is_sse_request(&req);
-
     // Collect request headers upfront
     let headers = req.headers().clone();
 
-    // Collect request body upfront (needed for retries)
+    // Collect request body upfront (needed for retries AND SSE detection)
     let body_bytes = req.collect().await
         .map_err(|e| crate::error::ProxyError::RequestError(e.to_string()))?
         .to_bytes();
+
+    // Detect SSE request: check Accept header OR "stream":true in body.
+    // Many LLM clients (Codex, Cursor, etc.) omit the Accept header and
+    // instead signal streaming via the JSON body field.
+    let is_sse = is_sse_from_headers(&headers) || crate::stream::is_streaming_body(&body_bytes);
 
     // Tracking variables for logging
     let request_id = generate_request_id();
@@ -190,6 +258,8 @@ pub async fn proxy_handler(
                                 response_bytes: 0,
                                 failover_chain: None,
                                 error: Some(format!("Pinned provider '{}' for model '{}' is unavailable", pinned_name, model)),
+                                upstream_error_body: None,
+                                upstream_response_body: None,
                                 timing,
                             },
                         );
@@ -252,6 +322,7 @@ pub async fn proxy_handler(
 
         // Attempt request with this provider
         match attempt_request(
+            &state.http_client,
             &provider_name,
             &provider,
             &path,
@@ -262,7 +333,7 @@ pub async fn proxy_handler(
             is_sse,
             request_timeout_secs,
         ).await {
-            Ok((response, resp_bytes, resp_ttfb_ms, token_usage, upstream_url)) => {
+            Ok((response, resp_bytes, resp_ttfb_ms, token_usage, upstream_url, sse_total_bytes, sse_body_buffer, upstream_error_body, upstream_response_body)) => {
                 let attempt_ms = t_attempt.elapsed().as_millis() as u64;
                 total_upstream_ms += attempt_ms;
                 let status_code = response.status().as_u16();
@@ -285,6 +356,8 @@ pub async fn proxy_handler(
                 }
 
                 // Finalize timing
+                // For SSE: mark timing as incomplete — will be finalized
+                // when the stream body is dropped.
                 if let Some(ref mut t) = timing {
                     t.select_provider_ms = total_select_ms;
                     t.upstream_total_ms = total_upstream_ms;
@@ -292,7 +365,8 @@ pub async fn proxy_handler(
                     t.retry_count = retry_count;
                     t.retry_providers.push(provider_name.clone());
                     t.retry_durations_ms.push(attempt_ms);
-                    t.completed = true;
+                    t.retry_errors.push("ok".to_string());
+                    t.completed = !is_sse;
                 }
 
                 let log_entry = crate::stats::LogEntry {
@@ -319,6 +393,10 @@ pub async fn proxy_handler(
                 state.rpm_counter.increment();
                 state.ws_broadcaster.broadcast_log(log_entry);
 
+                // Capture journal timestamp before writing entry
+                let journal_timestamp = chrono::Utc::now().to_rfc3339();
+                let stream_start = std::time::Instant::now();
+
                 write_request_journal(
                     &state,
                     JournalParams {
@@ -336,9 +414,48 @@ pub async fn proxy_handler(
                         response_bytes,
                         failover_chain: if failover_chain.len() > 1 { Some(failover_chain.clone()) } else { None },
                         error: None,
+                        upstream_error_body,
+                        upstream_response_body,
                         timing,
                     },
                 );
+
+                // For SSE responses, wrap the body with a drop guard that
+                // finalizes timing when the stream completes.
+                if is_sse {
+                    let journal = state.request_journal.clone();
+                    let entry_id = request_id.clone();
+                    let total_bytes = sse_total_bytes.unwrap();
+                    let body_buffer = sse_body_buffer.unwrap();
+                    let (parts, body) = response.into_parts();
+                    let guard = SseStreamGuard::new(
+                        body,
+                        total_bytes,
+                        body_buffer,
+                        Box::new(move |final_bytes: u64, captured_body: Vec<u8>| {
+                            let stream_duration_ms = stream_start.elapsed().as_millis() as u64;
+                            tracing::debug!(
+                                id = %entry_id,
+                                stream_duration_ms,
+                                total_bytes = final_bytes,
+                                captured_body_len = captured_body.len(),
+                                "SSE stream completed, finalizing journal entry"
+                            );
+                            tokio::spawn(async move {
+                                journal
+                                    .finalize_sse_entry(
+                                        &entry_id,
+                                        &journal_timestamp,
+                                        final_bytes,
+                                        stream_duration_ms,
+                                        captured_body,
+                                    )
+                                    .await;
+                            });
+                        }),
+                    );
+                    return Ok(hyper::Response::from_parts(parts, guard.boxed()));
+                }
 
                 return Ok(response);
             }
@@ -353,6 +470,7 @@ pub async fn proxy_handler(
                 if let Some(ref mut t) = timing {
                     t.retry_providers.push(provider_name.clone());
                     t.retry_durations_ms.push(attempt_ms);
+                    t.retry_errors.push(classify_error(&e).to_string());
                 }
 
                 if is_pinned {
@@ -387,6 +505,8 @@ pub async fn proxy_handler(
                             response_bytes: 0,
                             failover_chain: if failover_chain.len() > 1 { Some(failover_chain) } else { None },
                             error: Some(e.to_string()),
+                            upstream_error_body: None,
+                            upstream_response_body: None,
                             timing,
                         },
                     );
@@ -455,6 +575,8 @@ pub async fn proxy_handler(
             response_bytes: 0,
             failover_chain: if failover_chain.len() > 1 { Some(failover_chain) } else { None },
             error: Some(error_msg.clone()),
+            upstream_error_body: None,
+            upstream_response_body: None,
             timing,
         },
     );
@@ -468,12 +590,21 @@ pub async fn proxy_handler(
     .await
 }
 
-fn is_sse_request(req: &hyper::Request<Incoming>) -> bool {
-    crate::stream::is_sse_request(req)
+/// Check Accept header for SSE from an already-cloned HeaderMap.
+fn is_sse_from_headers(headers: &hyper::HeaderMap) -> bool {
+    if let Some(accept) = headers.get(hyper::header::ACCEPT) {
+        if let Ok(accept_str) = accept.to_str() {
+            if accept_str.contains("text/event-stream") {
+                return true;
+            }
+        }
+    }
+    false
 }
 
-#[tracing::instrument(name = "attempt_request", skip(provider, headers, body_bytes, state), fields(provider = %provider_name))]
+#[tracing::instrument(name = "attempt_request", skip(provider, headers, body_bytes, http_client, state), fields(provider = %provider_name))]
 async fn attempt_request(
+    http_client: &HttpClient,
     provider_name: &str,
     provider: &Arc<crate::provider::Provider>,
     path: &str,
@@ -483,8 +614,12 @@ async fn attempt_request(
     state: &AppState,
     is_sse: bool,
     request_timeout_secs: u64,
-) -> Result<(hyper::Response<ResponseBody>, u64, u64, Option<crate::stats::TokenUsage>, String), crate::error::ProxyError> {
-    // Returns: (response, response_bytes, ttfb_ms, token_usage)
+) -> Result<(hyper::Response<ResponseBody>, u64, u64, Option<crate::stats::TokenUsage>, String, Option<Arc<std::sync::atomic::AtomicU64>>, Option<Arc<std::sync::Mutex<Vec<u8>>>>, Option<String>, Option<String>), crate::error::ProxyError> {
+    // Returns: (response, response_bytes, ttfb_ms, token_usage, upstream_url, sse_total_bytes, sse_body_buffer, upstream_error_body, upstream_response_body)
+    // sse_total_bytes is Some(arc) for SSE responses, None otherwise.
+    // sse_body_buffer is Some(arc) for SSE responses, None otherwise.
+    // upstream_error_body is Some(truncated body) for non-2xx responses, None otherwise.
+    // upstream_response_body is Some(truncated body) for non-SSE 2xx responses, None otherwise.
     // Extract config values (needed to avoid holding RwLock across await)
     let (base_url, api_key, extra_headers) = {
         let config = provider.config.read().unwrap();
@@ -515,31 +650,18 @@ async fn attempt_request(
     }
 
     let upstream_req = upstream_req_builder
-        .body(Full::new(body_bytes.clone()))
+        .body(Full::new(body_bytes.clone()).map_err(|never| match never {}).boxed())
         .map_err(|e| crate::error::ProxyError::RequestError(e.to_string()))?;
-
-    // Create HTTP client with timeout
-    let https = hyper_rustls::HttpsConnectorBuilder::new()
-        .with_native_roots()
-        .unwrap()
-        .https_only()
-        .enable_http1()
-        .build();
 
     let timeout = std::time::Duration::from_secs(request_timeout_secs);
 
-    let client: hyper_util::client::legacy::Client<_, Full<Bytes>> =
-        hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
-            .pool_idle_timeout(std::time::Duration::from_secs(30))
-            .build(https);
-
-    // Send request to upstream with timeout
+    // Send request to upstream with timeout using shared connection pool
     tracing::debug!(url = %upstream_url, is_sse = is_sse, "Sending request to upstream");
 
     let ttfb_start = std::time::Instant::now();
     let response = tokio::time::timeout(
         timeout,
-        client.request(upstream_req)
+        http_client.request(upstream_req)
     ).await
         .map_err(|_| crate::error::ProxyError::RequestError("Request timeout".to_string()))?
         .map_err(|e| crate::error::ProxyError::HttpError(e.to_string()))?;
@@ -557,6 +679,12 @@ async fn attempt_request(
             .map_err(|e| crate::error::ProxyError::HttpError(e.to_string()))?
             .to_bytes();
 
+        // Truncate error body for diagnostic capture (max 4KB UTF-8)
+        let error_body_snippet = |bytes: &Bytes| -> Option<String> {
+            let end = bytes.len().min(4096);
+            std::str::from_utf8(&bytes[..end]).ok().map(|s| s.to_string())
+        };
+
         // Check for quota errors (inspect body for 403)
         let is_quota = if status == hyper::StatusCode::TOO_MANY_REQUESTS {
             true
@@ -569,16 +697,25 @@ async fn attempt_request(
         if is_quota {
             tracing::warn!(provider = %provider_name, "Quota exhausted, marking provider as cooldown");
             state.provider_manager.mark_quota_exhausted(provider_name);
-            return Err(crate::error::ProxyError::QuotaExhausted(provider_name.to_string()));
+            let body = error_body_snippet(&response_bytes)
+                .unwrap_or_else(|| "<non-utf8 body>".to_string());
+            return Err(crate::error::ProxyError::QuotaExhausted(
+                format!("{} | {}", provider_name, body),
+            ));
         }
 
         // Check for 5xx errors - should retry
         if status.as_u16() >= 500 && status.as_u16() < 600 {
             state.provider_manager.mark_failure(provider_name);
-            return Err(crate::error::ProxyError::HttpError(format!("Upstream error: {}", status)));
+            let body = error_body_snippet(&response_bytes)
+                .unwrap_or_else(|| "<non-utf8 body>".to_string());
+            return Err(crate::error::ProxyError::HttpError(
+                format!("Upstream error: {} | {}", status, body),
+            ));
         }
 
-        // Non-retryable error - return response
+        // Non-retryable error - return response to client
+        let upstream_error_body = error_body_snippet(&response_bytes);
         let mut downstream_response = hyper::Response::builder().status(status);
         for (name, value) in response_headers.iter() {
             downstream_response = downstream_response.header(name, value);
@@ -588,7 +725,7 @@ async fn attempt_request(
         let token_usage = extract_token_usage(&response_bytes);
         return Ok((downstream_response
             .body(full(response_bytes))
-            .unwrap(), resp_bytes, ttfb_ms, token_usage, upstream_url));
+            .unwrap(), resp_bytes, ttfb_ms, token_usage, upstream_url, None, None, upstream_error_body, None));
     }
 
     // Success response
@@ -606,7 +743,25 @@ async fn attempt_request(
         // Stream response for SSE
         tracing::info!("Streaming SSE response");
 
+        // Track total SSE stream bytes via shared counter and accumulate body for journal.
+        let total_bytes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0u64));
+        let body_buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+
+        let total_bytes_clone = total_bytes.clone();
+        let body_buffer_clone = body_buffer.clone();
         let stream = response.into_data_stream()
+            .inspect_ok(move |chunk: &Bytes| {
+                total_bytes_clone.fetch_add(chunk.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                // Accumulate chunks into body buffer, capped at SSE_BODY_CAPTURE_CAP.
+                {
+                    let mut buf = body_buffer_clone.lock().unwrap();
+                    if buf.len() < SSE_BODY_CAPTURE_CAP {
+                        let remaining = SSE_BODY_CAPTURE_CAP - buf.len();
+                        let end = chunk.len().min(remaining);
+                        buf.extend_from_slice(&chunk[..end]);
+                    }
+                }
+            })
             .map_ok(Frame::data);
 
         let body = StreamBody::new(stream).boxed();
@@ -616,9 +771,12 @@ async fn attempt_request(
             downstream_response = downstream_response.header(name, value);
         }
 
+        // For SSE: upstream_total_ms = TTFB (time to first chunk from upstream).
+        // The actual stream duration will be measured via the on_drop callback
+        // in proxy_handler. total_bytes and body_buffer are tracked via the inspector above.
         Ok((downstream_response
             .body(body)
-            .unwrap(), 0, ttfb_ms, None, upstream_url))
+            .unwrap(), 0, ttfb_ms, None, upstream_url, Some(total_bytes), Some(body_buffer), None, None))
     } else {
         // Buffer response for non-SSE
         let resp_bytes = response.collect().await
@@ -635,9 +793,22 @@ async fn attempt_request(
             downstream_response = downstream_response.header(name, value);
         }
 
+        // Capture response body for journal (truncate to max bytes, UTF-8 only)
+        let upstream_response_body = {
+            let cfg = state.config.read().unwrap();
+            let rj = &cfg.observability.request_journal;
+            if rj.capture_response_body {
+                let max_bytes = rj.max_response_body_bytes as usize;
+                let end = resp_bytes.len().min(max_bytes);
+                std::str::from_utf8(&resp_bytes[..end]).ok().map(|s| s.to_string())
+            } else {
+                None
+            }
+        };
+
         Ok((downstream_response
             .body(full(resp_bytes))
-            .unwrap(), response_bytes_val, ttfb_ms, token_usage, upstream_url))
+            .unwrap(), response_bytes_val, ttfb_ms, token_usage, upstream_url, None, None, None, upstream_response_body))
     }
 }
 
@@ -656,6 +827,7 @@ pub struct AppState {
     pub request_journal: Arc<crate::request_journal::RequestJournalWriter>,
     pub last_reloaded: Arc<std::sync::Mutex<Option<String>>>,
     pub trace_sampler: Option<Arc<crate::trace_layer::TraceSampler>>,
+    pub http_client: HttpClient,
 }
 
 impl AppState {
@@ -695,10 +867,10 @@ impl AppState {
 
 /// Result of provider selection with model rules.
 enum SelectResult {
-    /// A matching provider was found.
-    Provider((String, Arc<crate::provider::Provider>)),
+    /// A matching provider was found, along with the rule pattern that matched.
+    Provider((String, Arc<crate::provider::Provider>), String),
     /// A rule matched, but the designated provider is not currently available.
-    RuleMatchedButUnavailable(String),
+    RuleMatchedButUnavailable(String, String),
     /// No rule matched — caller should fall back to default strategy.
     NoRule,
 }
@@ -727,8 +899,8 @@ fn select_provider_normal(
         "Selecting provider for model"
     );
     match select_with_rules(model, providers, &rules) {
-        SelectResult::Provider((name, p)) => {
-            let reason = format!("rule:{}", name);
+        SelectResult::Provider((name, p), pattern) => {
+            let reason = format!("rule:{}→{}", pattern, name);
             Some(ProviderSelection {
                 provider_name: name,
                 provider: p,
@@ -736,10 +908,11 @@ fn select_provider_normal(
                 selection_reason: reason,
             })
         }
-        SelectResult::RuleMatchedButUnavailable(target) => {
+        SelectResult::RuleMatchedButUnavailable(target, pattern) => {
             tracing::warn!(
                 model = %model,
                 target_provider = %target,
+                pattern = %pattern,
                 "Model rule matched but target provider is unavailable, stopping retry"
             );
             None
@@ -772,8 +945,8 @@ fn select_with_rules(
                 "Model rule matched"
             );
             return match providers.iter().find(|(name, _)| name == &rule.target_provider) {
-                Some((name, p)) => SelectResult::Provider((name.clone(), Arc::clone(p))),
-                None => SelectResult::RuleMatchedButUnavailable(rule.target_provider.clone()),
+                Some((name, p)) => SelectResult::Provider((name.clone(), Arc::clone(p)), rule.pattern.clone()),
+                None => SelectResult::RuleMatchedButUnavailable(rule.target_provider.clone(), rule.pattern.clone()),
             };
         }
     }
@@ -860,6 +1033,37 @@ fn generate_request_id() -> String {
         })
         .collect();
     format!("req_{}", id)
+}
+
+/// Classify a ProxyError into a short label for retry tracking.
+fn classify_error(e: &crate::error::ProxyError) -> &'static str {
+    match e {
+        crate::error::ProxyError::RequestError(msg) => {
+            let lower = msg.to_lowercase();
+            if lower.contains("timeout") {
+                "timeout"
+            } else if lower.contains("connection") || lower.contains("connect") || lower.contains("refused") {
+                "connection"
+            } else {
+                "error"
+            }
+        }
+        crate::error::ProxyError::QuotaExhausted(_) => "quota",
+        crate::error::ProxyError::HttpError(msg) => {
+            let lower = msg.to_lowercase();
+            if lower.contains("429") {
+                "429"
+            } else if lower.contains("upstream error") {
+                // 5xx from upstream: "Upstream error: 502 Bad Gateway"
+                "5xx"
+            } else {
+                "http_4xx"
+            }
+        }
+        crate::error::ProxyError::ProviderError(_) => "provider",
+        crate::error::ProxyError::ConfigError(_) => "config",
+        crate::error::ProxyError::AllProvidersFailed(_) => "all_failed",
+    }
 }
 
 /// Extract token usage from API response body.
@@ -989,6 +1193,8 @@ struct JournalParams<'a> {
     response_bytes: u64,
     failover_chain: Option<Vec<String>>,
     error: Option<String>,
+    upstream_error_body: Option<String>,
+    upstream_response_body: Option<String>,
     timing: Option<crate::request_journal::RequestTiming>,
 }
 
@@ -1039,6 +1245,14 @@ fn write_request_journal(
         response_bytes: params.response_bytes,
         failover_chain: params.failover_chain,
         error: params.error,
+        upstream_error_body: params.upstream_error_body,
+        response_body_text: params.upstream_response_body
+            .as_deref()
+            .and_then(crate::request_journal::extract_response_content)
+            .or(params.upstream_response_body.clone()),
+        response_body_base64: None,
+        upstream_response_body: params.upstream_response_body,
+        sse_raw_body: None,
         timing: params.timing,
     };
 

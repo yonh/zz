@@ -9,6 +9,32 @@ pub struct Config {
     pub provider_configs: Vec<ProviderConfig>,
     #[serde(default)]
     pub observability: ObservabilityConfig,
+    #[serde(default)]
+    pub admin: AdminConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AdminConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default = "default_allowed_origins")]
+    pub allowed_origins: Vec<String>,
+}
+
+impl Default for AdminConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            api_key: String::new(),
+            allowed_origins: default_allowed_origins(),
+        }
+    }
+}
+
+fn default_allowed_origins() -> Vec<String> {
+    vec!["http://localhost:*".to_string()]
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -103,6 +129,10 @@ pub struct RequestJournalConfig {
     pub retention_days: u64,
     #[serde(default = "default_redact_headers")]
     pub redact_headers: Vec<String>,
+    #[serde(default)]
+    pub capture_response_body: bool,
+    #[serde(default = "default_max_response_body_bytes")]
+    pub max_response_body_bytes: u64,
 }
 
 impl Default for RequestJournalConfig {
@@ -112,8 +142,14 @@ impl Default for RequestJournalConfig {
             storage_dir: default_request_journal_storage_dir(),
             retention_days: default_request_journal_retention_days(),
             redact_headers: default_redact_headers(),
+            capture_response_body: true, // 默认启用，方便调试查看远程返回
+            max_response_body_bytes: default_max_response_body_bytes(),
         }
     }
+}
+
+fn default_max_response_body_bytes() -> u64 {
+    10240 // 10KB
 }
 
 fn default_request_journal_storage_dir() -> String {

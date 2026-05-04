@@ -13,11 +13,34 @@ import type {
 } from "./types";
 
 const API_BASE = "/zz/api";
+const ADMIN_KEY_STORAGE_KEY = "zz_admin_key";
+
+function getAdminKey(): string | null {
+  return localStorage.getItem(ADMIN_KEY_STORAGE_KEY);
+}
+
+export function setAdminKey(key: string): void {
+  localStorage.setItem(ADMIN_KEY_STORAGE_KEY, key);
+}
+
+export function clearAdminKey(): void {
+  localStorage.removeItem(ADMIN_KEY_STORAGE_KEY);
+}
 
 async function apiFetch<T>(path: string, options?: RequestInit): Promise<T> {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    ...(options?.headers as Record<string, string>),
+  };
+
+  const adminKey = getAdminKey();
+  if (adminKey) {
+    headers["X-Admin-Key"] = adminKey;
+  }
+
   const resp = await fetch(`${API_BASE}${path}`, {
     ...options,
-    headers: { "Content-Type": "application/json", ...options?.headers },
+    headers,
   });
   if (!resp.ok) throw new Error(`API error: ${resp.status}`);
   if (resp.status === 204) return undefined as T;
@@ -89,6 +112,8 @@ export const api = {
 
   getRequestJournalStatus: () =>
     apiFetch<RequestJournalStatus>("/request-journal/status"),
+  getRequestJournalFacets: () =>
+    apiFetch<{ clients: string[]; providers: string[]; models: string[] }>("/request-journal/facets"),
   getRequestJournal: (query: RequestJournalQuery & { offset?: number; limit?: number }) => {
     const qs = buildQueryString({
       client: query.client,
@@ -97,6 +122,8 @@ export const api = {
       status: query.status,
       path: query.path,
       date: query.date,
+      failed: query.failed ? "true" : undefined,
+      slow: query.slow ? "true" : undefined,
       offset: query.offset,
       limit: query.limit,
     });
@@ -112,6 +139,8 @@ export const api = {
       status: query.status,
       path: query.path,
       date: query.date,
+      failed: query.failed ? "true" : undefined,
+      slow: query.slow ? "true" : undefined,
     });
     window.open(`${API_BASE}/request-journal/export${qs}`, "_blank");
   },

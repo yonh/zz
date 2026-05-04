@@ -162,6 +162,7 @@ export interface RequestTiming {
   retry_count: number;
   retry_providers: string[];
   retry_durations_ms: number[];
+  retry_errors: string[];
   available_providers: number;
   selection_reason: string;
   completed: boolean;
@@ -185,8 +186,14 @@ export interface RequestJournalEntry {
   request_body_base64?: string;
   request_bytes: number;
   response_bytes: number;
+  response_body_text?: string;
+  response_body_base64?: string;
   failover_chain?: string[];
   error?: string;
+  upstream_error_body?: string;
+  upstream_response_body?: string;
+  /** Raw SSE event stream for debugging streaming protocol (first 4KB) */
+  sse_raw_body?: string;
   timing?: RequestTiming;
 }
 
@@ -232,4 +239,6 @@ export interface RequestJournalQuery {
   status?: number;
   path?: string;
   date?: string;
+  failed?: boolean;
+  slow?: boolean;
 }
