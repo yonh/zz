@@ -234,6 +234,57 @@ pub fn target_path(source: ApiType, target: ApiType, inbound_path: &str) -> Resu
         (ApiType::OpenAIChat, ApiType::OpenAIResponses, p) if p.starts_with("/c2r/") => {
             Ok("/v1/responses".to_string())
         }
+
+        // === Pass-through routes (source == target) ===
+        // /anthropic/v1/messages → /v1/messages (Anthropic pass-through)
+        // /anthropic → /v1/messages (default Anthropic endpoint)
+        (ApiType::Anthropic, ApiType::Anthropic, p) if p.starts_with("/anthropic/") => {
+            Ok(p.strip_prefix("/anthropic").unwrap_or(p).to_string())
+        }
+        (ApiType::Anthropic, ApiType::Anthropic, "/anthropic") => {
+            Ok("/v1/messages".to_string())
+        }
+        // /openai/chat/completions → /v1/chat/completions (OpenAI Chat pass-through)
+        // /openai/v1/chat/completions → /v1/chat/completions
+        // /openai → /v1/chat/completions (default OpenAI endpoint)
+        (ApiType::OpenAIChat, ApiType::OpenAIChat, p) if p.starts_with("/openai/") => {
+            let stripped = p.strip_prefix("/openai").unwrap_or(p);
+            // If path already starts with /v1/, use as-is; otherwise prepend /v1
+            if stripped.starts_with("/v1/") {
+                Ok(stripped.to_string())
+            } else {
+                Ok(format!("/v1{}", stripped))
+            }
+        }
+        (ApiType::OpenAIChat, ApiType::OpenAIChat, "/openai") => {
+            Ok("/v1/chat/completions".to_string())
+        }
+        // /responses/v1/responses → /v1/responses (Responses pass-through)
+        // /responses → /v1/responses
+        (ApiType::OpenAIResponses, ApiType::OpenAIResponses, p) if p.starts_with("/responses/") => {
+            let stripped = p.strip_prefix("/responses").unwrap_or(p);
+            if stripped.starts_with("/v1/") {
+                Ok(stripped.to_string())
+            } else if stripped.is_empty() || stripped == "/" {
+                Ok("/v1/responses".to_string())
+            } else {
+                Ok(format!("/v1/responses{}", stripped))
+            }
+        }
+        (ApiType::OpenAIResponses, ApiType::OpenAIResponses, "/responses") => {
+            Ok("/v1/responses".to_string())
+        }
+
+        // === Conversion routes ===
+        // /a2r/ (Anthropic → Responses): /a2r/v1/messages → /v1/responses
+        (ApiType::Anthropic, ApiType::OpenAIResponses, p) if p.starts_with("/a2r/") => {
+            Ok("/v1/responses".to_string())
+        }
+        // /r2a/ (Responses → Anthropic): /r2a/responses → /v1/messages
+        (ApiType::OpenAIResponses, ApiType::Anthropic, p) if p.starts_with("/r2a/") => {
+            Ok("/v1/messages".to_string())
+        }
+
         // Other paths under conversion prefixes are not supported yet
         (ApiType::Anthropic, ApiType::OpenAIChat, _) if inbound_path.starts_with("/a2o/v1/") => {
             Err(ConversionError::new(
@@ -450,10 +501,66 @@ mod tests {
         let result = target_path(ApiType::OpenAIChat, ApiType::Anthropic, "/o2a/v1/models");
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().code, "unsupported_feature");
+    }
 
-        // Test unsupported combinations
-        let result = target_path(ApiType::Anthropic, ApiType::Anthropic, "/v1/messages");
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code, "unsupported_feature");
+    #[test]
+    fn target_path_passthrough_routes() {
+        // Anthropic pass-through: /anthropic/v1/messages → /v1/messages
+        let result = target_path(ApiType::Anthropic, ApiType::Anthropic, "/anthropic/v1/messages");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "/v1/messages");
+
+        // Anthropic pass-through without path: /anthropic → /v1/messages
+        let result = target_path(ApiType::Anthropic, ApiType::Anthropic, "/anthropic");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "/v1/messages");
+
+        // OpenAI Chat pass-through: /openai/chat/completions → /v1/chat/completions
+        let result = target_path(ApiType::OpenAIChat, ApiType::OpenAIChat, "/openai/chat/completions");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "/v1/chat/completions");
+
+        // OpenAI Chat pass-through with /v1 prefix: /openai/v1/chat/completions → /v1/chat/completions
+        let result = target_path(ApiType::OpenAIChat, ApiType::OpenAIChat, "/openai/v1/chat/completions");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "/v1/chat/completions");
+
+        // OpenAI Chat pass-through without path: /openai → /v1/chat/completions
+        let result = target_path(ApiType::OpenAIChat, ApiType::OpenAIChat, "/openai");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "/v1/chat/completions");
+
+        // Responses pass-through: /responses/v1/responses → /v1/responses
+        let result = target_path(ApiType::OpenAIResponses, ApiType::OpenAIResponses, "/responses/v1/responses");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "/v1/responses");
+
+        // Responses pass-through: /responses → /v1/responses
+        let result = target_path(ApiType::OpenAIResponses, ApiType::OpenAIResponses, "/responses");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "/v1/responses");
+    }
+
+    #[test]
+    fn target_path_conversion_routes() {
+        // /a2r/ (Anthropic → Responses)
+        let result = target_path(ApiType::Anthropic, ApiType::OpenAIResponses, "/a2r/v1/messages");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "/v1/responses");
+
+        // /r2a/ (Responses → Anthropic)
+        let result = target_path(ApiType::OpenAIResponses, ApiType::Anthropic, "/r2a/responses");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "/v1/messages");
+
+        // /r2c/ (Responses → Chat)
+        let result = target_path(ApiType::OpenAIResponses, ApiType::OpenAIChat, "/r2c/responses");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "/v1/chat/completions");
+
+        // /c2r/ (Chat → Responses)
+        let result = target_path(ApiType::OpenAIChat, ApiType::OpenAIResponses, "/c2r/chat/completions");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "/v1/responses");
     }
 }

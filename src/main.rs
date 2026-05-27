@@ -333,22 +333,70 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                 };
                             }
-                            if path.starts_with("/a2r/") || path.starts_with("/r2a/") || path.starts_with("/anthropic/") || path.starts_with("/openai/") || path.starts_with("/responses/") {
-                                // Not implemented yet - return 501
-                                let prefix = path.split('/').nth(1).unwrap_or("unknown");
-                                let error_body = serde_json::json!({
-                                    "error": {
-                                        "type": "not_implemented_error",
-                                        "message": format!("Conversion prefix not implemented yet: {}", prefix)
+                            // API format entry points: force request format
+                            // /anthropic/ - client sends Anthropic format
+                            // /openai/ - client sends OpenAI Chat format
+                            // /responses/ - client sends OpenAI Responses format
+                            if path.starts_with("/anthropic/") || path == "/anthropic" {
+                                return match proxy::conversion_proxy_handler(req, state, crate::converter::ApiType::Anthropic, crate::converter::ApiType::Anthropic).await {
+                                    Ok(resp) => Ok(resp),
+                                    Err(e) => {
+                                        tracing::error!(error = ?e, "Anthropic proxy error");
+                                        Ok(hyper::Response::builder()
+                                            .status(hyper::StatusCode::INTERNAL_SERVER_ERROR)
+                                            .body(full(format!("Anthropic proxy error: {}", e)))
+                                            .unwrap())
                                     }
-                                });
-                                return Ok::<_, hyper::Error>(
-                                    hyper::Response::builder()
-                                        .status(hyper::StatusCode::NOT_IMPLEMENTED)
-                                        .header("content-type", "application/json")
-                                        .body(full(error_body.to_string()))
-                                        .unwrap()
-                                );
+                                };
+                            }
+                            if path.starts_with("/openai/") || path == "/openai" {
+                                return match proxy::conversion_proxy_handler(req, state, crate::converter::ApiType::OpenAIChat, crate::converter::ApiType::OpenAIChat).await {
+                                    Ok(resp) => Ok(resp),
+                                    Err(e) => {
+                                        tracing::error!(error = ?e, "OpenAI proxy error");
+                                        Ok(hyper::Response::builder()
+                                            .status(hyper::StatusCode::INTERNAL_SERVER_ERROR)
+                                            .body(full(format!("OpenAI proxy error: {}", e)))
+                                            .unwrap())
+                                    }
+                                };
+                            }
+                            if path.starts_with("/responses/") || path == "/responses" {
+                                return match proxy::conversion_proxy_handler(req, state, crate::converter::ApiType::OpenAIResponses, crate::converter::ApiType::OpenAIResponses).await {
+                                    Ok(resp) => Ok(resp),
+                                    Err(e) => {
+                                        tracing::error!(error = ?e, "Responses proxy error");
+                                        Ok(hyper::Response::builder()
+                                            .status(hyper::StatusCode::INTERNAL_SERVER_ERROR)
+                                            .body(full(format!("Responses proxy error: {}", e)))
+                                            .unwrap())
+                                    }
+                                };
+                            }
+                            // Symmetric conversion routes
+                            if path.starts_with("/a2r/") || path == "/a2r" {
+                                return match proxy::conversion_proxy_handler(req, state, crate::converter::ApiType::Anthropic, crate::converter::ApiType::OpenAIResponses).await {
+                                    Ok(resp) => Ok(resp),
+                                    Err(e) => {
+                                        tracing::error!(error = ?e, "A2R proxy error");
+                                        Ok(hyper::Response::builder()
+                                            .status(hyper::StatusCode::INTERNAL_SERVER_ERROR)
+                                            .body(full(format!("A2R proxy error: {}", e)))
+                                            .unwrap())
+                                    }
+                                };
+                            }
+                            if path.starts_with("/r2a/") || path == "/r2a" {
+                                return match proxy::conversion_proxy_handler(req, state, crate::converter::ApiType::OpenAIResponses, crate::converter::ApiType::Anthropic).await {
+                                    Ok(resp) => Ok(resp),
+                                    Err(e) => {
+                                        tracing::error!(error = ?e, "R2A proxy error");
+                                        Ok(hyper::Response::builder()
+                                            .status(hyper::StatusCode::INTERNAL_SERVER_ERROR)
+                                            .body(full(format!("R2A proxy error: {}", e)))
+                                            .unwrap())
+                                    }
+                                };
                             }
 
                             // Handle regular proxy request (/v1/*)

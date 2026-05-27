@@ -265,16 +265,18 @@ impl ProviderManager {
                 // Check if provider's resolved api_type matches target
                 let config = p.config.read().unwrap();
                 let provider_api_type = config.resolved_api_type();
-                
+
                 // Strict matching: target=OpenAIChat only matches api_type ∈ {"openai-chat","auto"}
                 // target=Anthropic only matches api_type ∈ {"anthropic","auto"}
                 // auto resolves to OpenAIChat (first version per plan)
+                // For OpenAIResponses: also accept OpenAIChat providers (for pass-through mode)
                 let matches_type = match (provider_api_type, target) {
                     (crate::converter::ApiType::OpenAIChat, crate::converter::ApiType::OpenAIChat) => true,
                     (crate::converter::ApiType::Anthropic, crate::converter::ApiType::Anthropic) => true,
+                    (crate::converter::ApiType::OpenAIChat, crate::converter::ApiType::OpenAIResponses) => true,
                     (provider_type, target_type) => provider_type == target_type,
                 };
-                
+
                 if !matches_type {
                     return false;
                 }

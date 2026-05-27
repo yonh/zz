@@ -773,7 +773,10 @@ pub async fn conversion_proxy_handler(
     };
 
     // Step 1: Select request converter based on source API type and convert with telemetry
-    let converted_body = match source {
+    // When source == target, no conversion is needed (pass-through mode)
+    let converted_body = if source == target {
+        Ok(body_bytes.clone())
+    } else { match source {
         crate::converter::ApiType::Anthropic => {
             let converter = &crate::converter::AnthropicToOpenAIConverter;
             if let Some(ref ctx) = telemetry_ctx {
@@ -800,7 +803,7 @@ pub async fn conversion_proxy_handler(
                 .body(full("Unsupported source API type"))
                 .unwrap());
         }
-    };
+    } };
 
     let converted_body = match converted_body {
         Ok(body) => {
@@ -969,6 +972,17 @@ pub async fn conversion_proxy_handler(
     let upstream_is_sse = is_sse_from_headers(&upstream_resp.headers())
         || is_sse_content_type(&upstream_resp.headers());
     tracing::debug!(request_id = %request_id, upstream_status = %upstream_status, upstream_is_sse = upstream_is_sse, "Step 7: Upstream response status");
+
+    // Pass-through mode: when source == target, no conversion needed
+    if source == target {
+        tracing::info!(request_id = %request_id, "Pass-through mode: returning upstream response as-is");
+        let (mut parts, body) = upstream_resp.into_parts();
+        parts.headers.insert(
+            hyper::header::HeaderName::from_static("x-conversion-status"),
+            hyper::header::HeaderValue::from_static("passthrough"),
+        );
+        return Ok(hyper::Response::from_parts(parts, body));
+    }
 
     // For Responses→Chat conversion with SSE upstream: buffer the stream,
     // extract the final Chat completion JSON, convert it, and return as
