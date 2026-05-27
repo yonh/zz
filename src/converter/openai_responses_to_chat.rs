@@ -40,9 +40,46 @@ impl ApiConverter for OpenAIResponsesToChatConverter {
                 // Simple string input → user message
                 messages.push(json!({"role": "user", "content": s}));
             } else if let Some(arr) = input.as_array() {
+                // Group consecutive function_call items into a single assistant message
+                let mut pending_tool_calls: Vec<Value> = Vec::new();
+
                 for item in arr {
-                    let msg = convert_input_item(item)?;
-                    messages.push(msg);
+                    let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("message");
+
+                    if item_type == "function_call" {
+                        // Buffer tool calls
+                        let id = item.get("call_id").or(item.get("id")).and_then(|v| v.as_str()).unwrap_or("");
+                        let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                        let args = item.get("arguments").and_then(|v| v.as_str()).unwrap_or("{}");
+                        pending_tool_calls.push(json!({
+                            "id": id,
+                            "type": "function",
+                            "function": {
+                                "name": name,
+                                "arguments": args
+                            }
+                        }));
+                    } else {
+                        // Flush pending tool_calls as a single assistant message
+                        if !pending_tool_calls.is_empty() {
+                            messages.push(json!({
+                                "role": "assistant",
+                                "content": null,
+                                "tool_calls": pending_tool_calls.drain(..).collect::<Vec<_>>()
+                            }));
+                        }
+                        let msg = convert_input_item(item)?;
+                        messages.push(msg);
+                    }
+                }
+
+                // Flush any remaining tool_calls
+                if !pending_tool_calls.is_empty() {
+                    messages.push(json!({
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": pending_tool_calls
+                    }));
                 }
             }
 
@@ -220,7 +257,37 @@ fn convert_input_item(item: &Value) -> Result<Value, ConversionError> {
             let content = extract_content_text(item);
             Ok(json!({"role": chat_role, "content": content}))
         }
+        "function_call" => {
+            // Responses function_call → Chat assistant message with tool_calls
+            let id = item.get("call_id").or(item.get("id")).and_then(|v| v.as_str()).unwrap_or("");
+            let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let args = item.get("arguments").and_then(|v| v.as_str()).unwrap_or("{}");
+            Ok(json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": id,
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": args
+                    }
+                }]
+            }))
+        }
+        "function_call_output" => {
+            // Responses function_call_output → Chat tool message
+            let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
+            let output = item.get("output").and_then(|v| v.as_str()).unwrap_or("");
+            Ok(json!({
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": output
+            }))
+        }
         _ => {
+            // Unknown types — skip gracefully instead of erroring
+            tracing::warn!(item_type = item_type, "Skipping unknown input_item type");
             Err(ConversionError::new(
                 ConversionErrorKind::UnsupportedFeature,
                 "unsupported_input_item_type",
