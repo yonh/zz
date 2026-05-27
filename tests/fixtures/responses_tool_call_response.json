@@ -1,0 +1,31 @@
+{
+  "id": "resp_67e8d7a0f8b4c4a0b2c3d4e5f6a7b8d0",
+  "object": "response",
+  "created": 1748332800,
+  "model": "gpt-4o-mini",
+  "output": [
+    {
+      "type": "function_call",
+      "id": "fc_abc123",
+      "call_id": "call_abc123",
+      "name": "get_weather",
+      "arguments": "{\"location\":\"Tokyo\"}"
+    },
+    {
+      "type": "message",
+      "id": "msg_def456",
+      "role": "assistant",
+      "content": [
+        {
+          "type": "output_text",
+          "text": "Let me check the weather in Tokyo for you.",
+          "annotations": []
+        }
+      ]
+    }
+  ],
+  "usage": {
+    "input_tokens": 85,
+    "output_tokens": 30
+  }
+}

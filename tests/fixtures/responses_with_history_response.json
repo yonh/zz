@@ -1,0 +1,24 @@
+{
+  "id": "resp_67e8d7a0f8b4c4a0b2c3d4e5f6a7b8e0",
+  "object": "response",
+  "created": 1748332800,
+  "model": "gpt-4o-mini",
+  "output": [
+    {
+      "type": "message",
+      "id": "msg_ghi789",
+      "role": "assistant",
+      "content": [
+        {
+          "type": "output_text",
+          "text": "4",
+          "annotations": []
+        }
+      ]
+    }
+  ],
+  "usage": {
+    "input_tokens": 28,
+    "output_tokens": 1
+  }
+}

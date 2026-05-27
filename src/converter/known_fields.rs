@@ -88,3 +88,31 @@ pub const KNOWN_NESTED_PATHS_OPENAI_CHAT: &[&str] = &[
     "tool_choice.type",
     "tool_choice.function",
 ];
+
+/// Known fields in OpenAI Responses request format (/v1/responses)
+pub const KNOWN_FIELDS_REQUEST_OPENAI_RESPONSES: &[&str] = &[
+    "model",
+    "input",
+    "instructions",
+    "tools",
+    "tool_choice",
+    "stream",
+    "temperature",
+    "top_p",
+    "max_output_tokens",
+    "metadata",
+    "store",
+    "previous_response_id",
+    "stop",
+];
+
+/// Known fields in OpenAI Responses response format
+pub const KNOWN_FIELDS_RESPONSE_OPENAI_RESPONSES: &[&str] = &[
+    "id",
+    "object",
+    "created",
+    "model",
+    "output",
+    "usage",
+    "status",
+];

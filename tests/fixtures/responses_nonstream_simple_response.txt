@@ -1,0 +1,1 @@
+data: {"id":"resp_abc","object":"response","created":1748332800,"model":"gpt-4o-mini","output":[{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"output_text","text":"Hello","annotations":[]}]}],"usage":{"input_tokens":10,"output_tokens":1}}

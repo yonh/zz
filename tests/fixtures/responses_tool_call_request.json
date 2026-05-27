@@ -1,0 +1,32 @@
+{
+  "input": [
+    {
+      "type": "message",
+      "role": "user",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "What is the weather in Tokyo?"
+        }
+      ]
+    }
+  ],
+  "model": "gpt-4o-mini",
+  "tools": [
+    {
+      "type": "function",
+      "name": "get_weather",
+      "description": "Get current weather for a city",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "location": {
+            "type": "string"
+          }
+        },
+        "required": ["location"]
+      }
+    }
+  ],
+  "tool_choice": "auto"
+}

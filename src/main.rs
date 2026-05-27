@@ -307,6 +307,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                 };
                             }
+                            // OpenAI Responses → OpenAI Chat (for Codex)
+                            if path.starts_with("/r2c/") {
+                                return match proxy::conversion_proxy_handler(req, state, crate::converter::ApiType::OpenAIResponses, crate::converter::ApiType::OpenAIChat).await {
+                                    Ok(resp) => Ok(resp),
+                                    Err(e) => {
+                                        tracing::error!(error = ?e, "Conversion proxy error");
+                                        Ok(hyper::Response::builder()
+                                            .status(hyper::StatusCode::INTERNAL_SERVER_ERROR)
+                                            .body(full(format!("Conversion proxy error: {}", e)))
+                                            .unwrap())
+                                    }
+                                };
+                            }
+                            // OpenAI Chat → OpenAI Responses (symmetric)
+                            if path.starts_with("/c2r/") {
+                                return match proxy::conversion_proxy_handler(req, state, crate::converter::ApiType::OpenAIChat, crate::converter::ApiType::OpenAIResponses).await {
+                                    Ok(resp) => Ok(resp),
+                                    Err(e) => {
+                                        tracing::error!(error = ?e, "Conversion proxy error");
+                                        Ok(hyper::Response::builder()
+                                            .status(hyper::StatusCode::INTERNAL_SERVER_ERROR)
+                                            .body(full(format!("Conversion proxy error: {}", e)))
+                                            .unwrap())
+                                    }
+                                };
+                            }
                             if path.starts_with("/a2r/") || path.starts_with("/r2a/") || path.starts_with("/anthropic/") || path.starts_with("/openai/") || path.starts_with("/responses/") {
                                 // Not implemented yet - return 501
                                 let prefix = path.split('/').nth(1).unwrap_or("unknown");

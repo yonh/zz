@@ -12,7 +12,33 @@ impl RequestRewriter {
             format!("{}/", base_url)
         };
         let url = url::Url::parse(&base)?;
-        let joined = url.join(path.trim_start_matches('/'))?;
+
+        // Avoid duplicating path segments when base_url already contains a prefix
+        // that overlaps with the start of path.
+        // e.g. base_url="https://host/v1" + path="/v1/chat/completions"
+        //      should produce "https://host/v1/chat/completions", not ".../v1/v1/..."
+        let base_path = url.path().trim_end_matches('/');
+        let trimmed_path = path.trim_start_matches('/');
+
+        // Find the last segment of base_url path and check if trimmed_path starts with it
+        let effective_path = if let Some(last_slash) = base_path.rfind('/') {
+            let base_suffix = &base_path[last_slash + 1..];
+            if !base_suffix.is_empty() && trimmed_path.starts_with(base_suffix) {
+                let rest = &trimmed_path[base_suffix.len()..];
+                if rest.is_empty() || rest.starts_with('/') {
+                    // Skip the overlapping prefix; use the rest (strip leading '/')
+                    rest.trim_start_matches('/')
+                } else {
+                    trimmed_path
+                }
+            } else {
+                trimmed_path
+            }
+        } else {
+            trimmed_path
+        };
+
+        let joined = url.join(effective_path)?;
         Ok(joined.to_string())
     }
 
@@ -88,6 +114,31 @@ mod tests {
         assert!(rewritten.get(hyper::header::HeaderName::from_static("api-key")).is_none());
         assert!(rewritten.get(hyper::header::HeaderName::from_static("api_key")).is_none());
         assert_eq!(rewritten.get(hyper::header::CONTENT_TYPE).unwrap(), "application/json");
+    }
+
+    /// Ensures overlapping path prefix is deduplicated
+    #[test]
+    fn rewrite_url_deduplicates_overlapping_prefix() {
+        // base_url ends with /v1, path starts with /v1/...
+        let result = RequestRewriter::rewrite_url(
+            "https://host.example.com/v1",
+            "/v1/chat/completions",
+        ).unwrap();
+        assert_eq!(result, "https://host.example.com/v1/chat/completions");
+
+        // base_url without /v1, path has /v1/... — no dedup needed
+        let result = RequestRewriter::rewrite_url(
+            "https://host.example.com",
+            "/v1/chat/completions",
+        ).unwrap();
+        assert_eq!(result, "https://host.example.com/v1/chat/completions");
+
+        // base_url ends with /v1/, path is /v1/messages
+        let result = RequestRewriter::rewrite_url(
+            "https://host.example.com/v1/",
+            "/v1/messages",
+        ).unwrap();
+        assert_eq!(result, "https://host.example.com/v1/messages");
     }
 
     /// Ensures configured custom headers can still be explicitly injected.

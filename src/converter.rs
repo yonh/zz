@@ -197,10 +197,12 @@ pub trait ApiConverter: Send + Sync {
 pub mod anthropic_to_openai;
 pub mod known_fields;
 pub mod openai_to_anthropic;
+pub mod openai_responses_to_chat;
 pub mod stream;
 pub mod telemetry;
 pub use anthropic_to_openai::AnthropicToOpenAIConverter;
 pub use openai_to_anthropic::OpenAIChatToAnthropicConverter;
+pub use openai_responses_to_chat::OpenAIResponsesToChatConverter;
 pub use stream::StreamConverter;
 pub use telemetry::{TelemetryContext, NoopTelemetry};
 
@@ -223,6 +225,14 @@ pub fn target_path(source: ApiType, target: ApiType, inbound_path: &str) -> Resu
         // OpenAI Chat → Anthropic: /o2a/v1/chat/completions → /v1/messages
         (ApiType::OpenAIChat, ApiType::Anthropic, "/o2a/v1/chat/completions") => {
             Ok("/v1/messages".to_string())
+        }
+        // OpenAI Responses → OpenAI Chat: /r2c/responses → /v1/chat/completions
+        (ApiType::OpenAIResponses, ApiType::OpenAIChat, p) if p.starts_with("/r2c/") => {
+            Ok("/v1/chat/completions".to_string())
+        }
+        // OpenAI Chat → OpenAI Responses: /c2r/chat/completions → /v1/responses
+        (ApiType::OpenAIChat, ApiType::OpenAIResponses, p) if p.starts_with("/c2r/") => {
+            Ok("/v1/responses".to_string())
         }
         // Other paths under conversion prefixes are not supported yet
         (ApiType::Anthropic, ApiType::OpenAIChat, _) if inbound_path.starts_with("/a2o/v1/") => {
