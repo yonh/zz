@@ -4,11 +4,156 @@ use http_body_util::{BodyExt, Full, combinators::BoxBody, StreamBody};
 use hyper::body::{Bytes, Frame, Incoming};
 use std::collections::HashSet;
 use tracing::Instrument;
-use futures_util::TryStreamExt;
+use futures_util::{StreamExt, TryStreamExt};
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use crate::converter::ApiConverter;
+use crate::converter::telemetry::TelemetryContext;
+use tokio::sync::mpsc;
 
 type ResponseBody = BoxBody<Bytes, hyper::Error>;
+
+/// Streaming body that converts SSE chunks on-the-fly
+///
+/// This body wraps an upstream SSE stream and converts each chunk through
+/// a StreamConverter before sending it to the client. This enables true
+/// streaming with low TTFB instead of collecting the entire response first.
+struct ConversionStreamBody {
+    /// Receiver for converted chunks
+    rx: mpsc::Receiver<Result<Bytes, hyper::Error>>,
+}
+
+impl ConversionStreamBody {
+    /// Create a new ConversionStreamBody that spawns a background task
+    /// to read from the upstream stream, convert chunks, and send them
+    /// through the channel.
+    fn new<B>(
+        mut upstream_body: B,
+        converter: Arc<std::sync::Mutex<crate::converter::stream::StreamConverter>>,
+    ) -> Self
+    where
+        B: hyper::body::Body<Data = Bytes, Error = hyper::Error> + Send + Unpin + 'static,
+    {
+        let (tx, rx) = mpsc::channel(32); // Buffer up to 32 converted chunks
+
+        // Spawn background task to handle streaming conversion
+        tokio::spawn(async move {
+            use http_body_util::BodyExt;
+            
+            loop {
+                // Read frame from upstream (no lock held)
+                let frame_result = upstream_body.frame().await;
+                
+                match frame_result {
+                    Some(Ok(frame)) => {
+                        let chunk_to_convert = frame.data_ref().map(|c| c.clone());
+                        let is_end = frame.is_trailers() || (frame.is_data() && frame.data_ref().map_or(false, |d| d.is_empty()));
+                        
+                        // Convert the chunk (lock held only during conversion)
+                        let converted_chunks = if let Some(chunk) = chunk_to_convert {
+                            let mut converter = converter.lock().unwrap();
+                            match converter.push(&chunk) {
+                                Ok(chunks) => Some(chunks),
+                                Err(e) => {
+                                    tracing::error!(error = ?e, "Stream conversion failed");
+                                    return;
+                                }
+                            }
+                        } else {
+                            None
+                        };
+                        
+                        // Send converted chunks (no lock held)
+                        if let Some(chunks) = converted_chunks {
+                            for converted_bytes in chunks {
+                                if tx.send(Ok(converted_bytes)).await.is_err() {
+                                    // Client disconnected, stop processing
+                                    return;
+                                }
+                            }
+                        }
+                        
+                        // Check if this is the last frame
+                        if is_end {
+                            // Finalize conversion (lock held only during finalization)
+                            let final_chunks = {
+                                let mut converter = converter.lock().unwrap();
+                                match converter.finalize() {
+                                    Ok(chunks) => chunks,
+                                    Err(e) => {
+                                        tracing::error!(error = ?e, "Stream finalization failed");
+                                        return;
+                                    }
+                                }
+                            };
+                            
+                            // Send final chunks (no lock held)
+                            for final_bytes in final_chunks {
+                                if tx.send(Ok(final_bytes)).await.is_err() {
+                                    return;
+                                }
+                            }
+                            return;
+                        }
+                    }
+                    Some(Err(e)) => {
+                        tracing::error!(error = ?e, "Upstream stream error");
+                        let _ = tx.send(Err(e));
+                        return;
+                    }
+                    None => {
+                        // Stream ended, finalize conversion
+                        let final_chunks = {
+                            let mut converter = converter.lock().unwrap();
+                            match converter.finalize() {
+                                Ok(chunks) => chunks,
+                                Err(e) => {
+                                    tracing::error!(error = ?e, "Stream finalization failed");
+                                    return;
+                                }
+                            }
+                        };
+                        
+                        for final_bytes in final_chunks {
+                            if tx.send(Ok(final_bytes)).await.is_err() {
+                                return;
+                            }
+                        }
+                        return;
+                    }
+                }
+            }
+        });
+
+        Self { rx }
+    }
+}
+
+impl hyper::body::Body for ConversionStreamBody {
+    type Data = Bytes;
+    type Error = hyper::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        match self.rx.poll_recv(cx) {
+            Poll::Ready(Some(Ok(bytes))) => {
+                Poll::Ready(Some(Ok(Frame::data(bytes))))
+            }
+            Poll::Ready(Some(Err(e))) => {
+                Poll::Ready(Some(Err(e)))
+            }
+            Poll::Ready(None) => {
+                // Stream ended
+                Poll::Ready(None)
+            }
+            Poll::Pending => {
+                Poll::Pending
+            }
+        }
+    }
+}
 
 /// Wrapper body that fires an `on_drop` callback when the SSE stream completes.
 ///
@@ -590,6 +735,331 @@ pub async fn proxy_handler(
     .await
 }
 
+/// Conversion proxy handler for API format translation
+///
+/// Handles requests to /a2o/* and /o2a/* prefixes, converting between API formats.
+/// Follows the flow specified in phase-P4 §2.
+pub async fn conversion_proxy_handler(
+    req: hyper::Request<Incoming>,
+    state: AppState,
+    source: crate::converter::ApiType,
+    target: crate::converter::ApiType,
+) -> Result<hyper::Response<ResponseBody>, crate::error::ProxyError> {
+    let path = req.uri().path().to_string();
+    let method = req.method().clone();
+
+    // Generate request ID for telemetry
+    let request_id = generate_request_id();
+
+    // Collect request headers upfront
+    let headers = req.headers().clone();
+
+    // Collect request body (full buffer for conversion)
+    let body_bytes = req.collect().await
+        .map_err(|e| crate::error::ProxyError::RequestError(e.to_string()))?
+        .to_bytes();
+
+    // Construct telemetry context
+    let telemetry_ctx = if state.telemetry.is_enabled() {
+        Some(std::sync::Arc::new(crate::converter::telemetry::RealTelemetry::new(
+            state.telemetry.clone(),
+            request_id.clone(),
+            path.clone(),
+            source,
+            target,
+        )))
+    } else {
+        None
+    };
+
+    // Step 1: Select request converter based on source API type and convert with telemetry
+    let converted_body = match source {
+        crate::converter::ApiType::Anthropic => {
+            let converter = &crate::converter::AnthropicToOpenAIConverter;
+            if let Some(ref ctx) = telemetry_ctx {
+                converter.convert_request_with_ctx(&body_bytes, crate::converter::TargetQuirks::default(), ctx.as_ref())
+            } else {
+                converter.convert_request(&body_bytes, target)
+            }
+        }
+        crate::converter::ApiType::OpenAIChat => {
+            let converter = &crate::converter::OpenAIChatToAnthropicConverter;
+            if let Some(ref ctx) = telemetry_ctx {
+                converter.convert_request_with_ctx(&body_bytes, ctx.as_ref())
+            } else {
+                converter.convert_request(&body_bytes, target)
+            }
+        }
+        _ => {
+            return Ok(hyper::Response::builder()
+                .status(hyper::StatusCode::BAD_REQUEST)
+                .body(full("Unsupported source API type"))
+                .unwrap());
+        }
+    };
+
+    let converted_body = match converted_body {
+        Ok(body) => body,
+        Err(conv_err) => {
+            tracing::error!(
+                error = ?conv_err,
+                code = %conv_err.code,
+                "Request conversion failed"
+            );
+
+            // Report error to telemetry if available
+            if let Some(ref ctx) = telemetry_ctx {
+                ctx.as_ref().report_error(&conv_err);
+            }
+
+            // Return error with conversion status headers
+            let error_body = match source {
+                crate::converter::ApiType::Anthropic => {
+                    // Anthropic-style error
+                    serde_json::json!({
+                        "type": "error",
+                        "error": {
+                            "type": "invalid_request_error",
+                            "message": format!("Request conversion failed: {}", conv_err.message)
+                        }
+                    })
+                }
+                _ => {
+                    // OpenAI-style error
+                    serde_json::json!({
+                        "error": {
+                            "message": format!("Request conversion failed: {}", conv_err.message),
+                            "type": "invalid_request_error",
+                            "code": conv_err.code
+                        }
+                    })
+                }
+            };
+
+            return Ok(hyper::Response::builder()
+                .status(hyper::StatusCode::BAD_GATEWAY)
+                .header("content-type", "application/json")
+                .header("X-Conversion-Status", "failed")
+                .header("X-Conversion-Phase", "request")
+                .header("X-Conversion-Error", conv_err.code)
+                .body(full(error_body.to_string()))
+                .unwrap());
+        }
+    };
+
+    // Step 2: Convert path using target_path
+    let target_path = match crate::converter::target_path(source, target, &path) {
+        Ok(p) => p,
+        Err(conv_err) => {
+            tracing::error!(
+                error = ?conv_err,
+                code = %conv_err.code,
+                "Path conversion failed"
+            );
+
+            let error_body = serde_json::json!({
+                "error": {
+                    "message": format!("Path conversion failed: {}", conv_err.message),
+                    "type": "invalid_request_error",
+                    "code": conv_err.code
+                }
+            });
+
+            return Ok(hyper::Response::builder()
+                .status(hyper::StatusCode::BAD_GATEWAY)
+                .header("content-type", "application/json")
+                .header("X-Conversion-Status", "failed")
+                .header("X-Conversion-Phase", "path")
+                .header("X-Conversion-Error", conv_err.code)
+                .body(full(error_body.to_string()))
+                .unwrap());
+        }
+    };
+
+    // Step 3: Extract model for provider selection
+    let model = extract_model(&converted_body);
+
+    // Step 4: Provider selection (filtered by target API type)
+    let providers = state.provider_manager
+        .select_for_target(target, if model != "unknown" { Some(&model) } else { None })
+        .ok_or_else(|| {
+            tracing::error!(target = ?target, model = %model, "No matching provider for target API type");
+            crate::error::ProxyError::AllProvidersFailed(vec![crate::error::ProxyError::ProviderError(
+                "no_matching_provider_for_target_api".to_string()
+            )])
+        })?;
+
+    if providers.is_empty() {
+        let error_body = serde_json::json!({
+            "error": {
+                "message": format!("No provider available for target API type: {:?}", target),
+                "type": "service_unavailable_error"
+            }
+        });
+
+        return Ok(hyper::Response::builder()
+            .status(hyper::StatusCode::BAD_GATEWAY)
+            .header("content-type", "application/json")
+            .body(full(error_body.to_string()))
+            .unwrap());
+    }
+
+    // Select first available provider (simplified selection for P4)
+    let (provider_name, provider) = providers.first().unwrap();
+
+    // Step 5: Detect if inbound request wants streaming
+    let inbound_is_sse = is_sse_from_headers(&headers) || crate::stream::is_streaming_body(&converted_body);
+
+    // Step 6: Attempt request with correct streaming flag
+    let request_timeout_secs = {
+        let config = state.config.read().unwrap();
+        config.server.request_timeout_secs
+    };
+
+    let (upstream_resp, _response_bytes, _ttfb_ms, _token_usage, _upstream_url, _sse_total_bytes, _sse_body_buffer, _upstream_error_body, _upstream_response_body) = attempt_request(
+        &state.http_client,
+        provider_name,
+        provider,
+        &target_path,
+        &method,
+        &headers,
+        &converted_body,
+        &state,
+        inbound_is_sse, // Pass detected streaming flag
+        request_timeout_secs,
+    ).await.map_err(|e| {
+        tracing::error!(error = ?e, "Upstream request failed");
+        e
+    })?;
+
+    // Step 7: Check if upstream response is streaming
+    let upstream_status = upstream_resp.status();
+    let upstream_is_sse = is_sse_from_headers(&upstream_resp.headers());
+    if upstream_is_sse {
+        // True streaming conversion using ConversionStreamBody
+        tracing::info!(source = ?source, target = ?target, "Converting streaming response");
+
+        let stream_converter = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::converter::stream::StreamConverter::new(target, source)
+        ));
+
+        // Extract the upstream body for streaming
+        let (mut parts, upstream_body) = upstream_resp.into_parts();
+
+        // Add conversion status headers to the upstream response
+        parts.headers.insert(
+            hyper::header::HeaderName::from_static("x-conversion-status"),
+            hyper::header::HeaderValue::from_static("success"),
+        );
+        parts.headers.insert(
+            hyper::header::HeaderName::from_static("x-conversion-source"),
+            source.to_string().parse().unwrap(),
+        );
+        parts.headers.insert(
+            hyper::header::HeaderName::from_static("x-conversion-target"),
+            target.to_string().parse().unwrap(),
+        );
+
+        // Create streaming body that converts chunks on-the-fly
+        let conversion_body = ConversionStreamBody::new(upstream_body, stream_converter);
+
+        return Ok(hyper::Response::from_parts(parts, http_body_util::BodyExt::boxed(conversion_body)));
+    }
+
+    // Step 7: Read upstream body
+    let upstream_body_bytes = upstream_resp.collect().await
+        .map_err(|e| crate::error::ProxyError::HttpError(e.to_string()))?
+        .to_bytes();
+
+    // Step 8: Select response converter based on target API type (upstream format) and convert with telemetry
+    let converted_response = match target {
+        crate::converter::ApiType::Anthropic => {
+            // target=Anthropic means upstream response is in Anthropic format.
+            // We need to convert Anthropic → source (OpenAIChat).
+            // convert_response(body, source_format, target_format, is_stream)
+            //   where source_format = format of the body passed in (upstream = target)
+            //         target_format = format to convert to (client expects = source)
+            let converter = &crate::converter::AnthropicToOpenAIConverter;
+            if let Some(ref ctx) = telemetry_ctx {
+                converter.convert_response_with_ctx(&upstream_body_bytes, ctx.as_ref())
+            } else {
+                converter.convert_response(&upstream_body_bytes, target, source, false)
+            }
+        }
+        crate::converter::ApiType::OpenAIChat => {
+            // target=OpenAIChat means upstream response is in OpenAI format.
+            // We need to convert OpenAIChat → source (Anthropic).
+            let converter = &crate::converter::OpenAIChatToAnthropicConverter;
+            if let Some(ref ctx) = telemetry_ctx {
+                converter.convert_response_with_ctx(&upstream_body_bytes, ctx.as_ref())
+            } else {
+                converter.convert_response(&upstream_body_bytes, target, source, false)
+            }
+        }
+        _ => {
+            tracing::error!(target = ?target, "Unsupported target API type for response conversion");
+            // Pass through upstream body without conversion
+            let body_str = std::str::from_utf8(&upstream_body_bytes).unwrap_or_else(|_| "[non-utf8]");
+            return Ok(hyper::Response::builder()
+                .status(upstream_status)
+                .header("content-type", "application/json")
+                .header("X-Conversion-Status", "failed")
+                .header("X-Conversion-Phase", "response")
+                .header("X-Conversion-Error", "unsupported_target_api")
+                .body(full(body_str.to_string()))
+                .unwrap());
+        }
+    };
+
+    let converted_response = match converted_response {
+        Ok(resp) => resp,
+        Err(conv_err) => {
+            // Check provider config for conversion fallback
+            let provider_config = provider.config.read().unwrap();
+            let enable_fallback = provider_config.enable_conversion_fallback;
+            drop(provider_config);
+
+            // Report error to telemetry if available
+            if let Some(ref ctx) = telemetry_ctx {
+                ctx.as_ref().report_error(&conv_err);
+            }
+
+            // Log detailed error information
+            tracing::warn!(
+                request_id = %request_id,
+                error_code = %conv_err.code,
+                field_path = ?conv_err.field_path,
+                error = ?conv_err,
+                "Response conversion failed"
+            );
+
+            // If fallback is disabled, return 502 error
+            if !enable_fallback {
+                return Err(crate::error::ProxyError::HttpError(conv_err.to_string()));
+            }
+
+            // Fallback: pass through upstream body with degradation headers
+            let body_str = std::str::from_utf8(&upstream_body_bytes).unwrap_or_else(|_| "[non-utf8]");
+            return Ok(hyper::Response::builder()
+                .status(upstream_status)
+                .header("content-type", "application/json")
+                .header("X-Conversion-Status", "failed")
+                .header("X-Conversion-Phase", "response")
+                .header("X-Conversion-Error", conv_err.code)
+                .body(full(body_str.to_string()))
+                .unwrap());
+        }
+    };
+
+    // Step 9: Return converted response with success header
+    Ok(hyper::Response::builder()
+        .status(upstream_status)
+        .header("content-type", "application/json")
+        .header("X-Conversion-Status", "success")
+        .body(full(converted_response))
+        .unwrap())
+}
+
 /// Check Accept header for SSE from an already-cloned HeaderMap.
 fn is_sse_from_headers(headers: &hyper::HeaderMap) -> bool {
     if let Some(accept) = headers.get(hyper::header::ACCEPT) {
@@ -764,7 +1234,7 @@ async fn attempt_request(
             })
             .map_ok(Frame::data);
 
-        let body = StreamBody::new(stream).boxed();
+        let body = http_body_util::BodyExt::boxed(StreamBody::new(stream));
 
         let mut downstream_response = hyper::Response::builder().status(status);
         for (name, value) in response_headers.iter() {
@@ -828,6 +1298,7 @@ pub struct AppState {
     pub last_reloaded: Arc<std::sync::Mutex<Option<String>>>,
     pub trace_sampler: Option<Arc<crate::trace_layer::TraceSampler>>,
     pub http_client: HttpClient,
+    pub telemetry: Arc<crate::converter::telemetry::InMemoryTelemetry>, // TODO: Wire into conversion handlers
 }
 
 impl AppState {
@@ -1260,4 +1731,44 @@ fn write_request_journal(
     tokio::spawn(async move {
         journal.write_entry(entry).await;
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_generate_request_id_is_unique() {
+        let id1 = generate_request_id();
+        let id2 = generate_request_id();
+        assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn test_generate_request_id_format() {
+        let id = generate_request_id();
+        // Request IDs should be non-empty and reasonable length
+        assert!(!id.is_empty());
+        assert!(id.len() <= 64);
+    }
+
+    #[test]
+    fn test_is_sse_from_headers_with_event_stream() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(hyper::header::ACCEPT, "text/event-stream".parse().unwrap());
+        assert!(is_sse_from_headers(&headers));
+    }
+
+    #[test]
+    fn test_is_sse_from_headers_without_event_stream() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(hyper::header::ACCEPT, "application/json".parse().unwrap());
+        assert!(!is_sse_from_headers(&headers));
+    }
+
+    #[test]
+    fn test_is_sse_from_headers_missing_accept() {
+        let headers = hyper::HeaderMap::new();
+        assert!(!is_sse_from_headers(&headers));
+    }
 }

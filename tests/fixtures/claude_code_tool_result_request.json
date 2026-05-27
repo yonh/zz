@@ -1,0 +1,52 @@
+{
+  "model": "claude-3-5-sonnet-20241022",
+  "max_tokens": 1024,
+  "messages": [
+    {
+      "role": "user",
+      "content": "What's the weather in San Francisco?"
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "text",
+          "text": "I'll check the weather for you."
+        },
+        {
+          "type": "tool_use",
+          "id": "toolu_abc123",
+          "name": "get_weather",
+          "input": {
+            "location": "San Francisco"
+          }
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "toolu_abc123",
+          "content": "The weather in San Francisco is 72°F and sunny."
+        }
+      ]
+    }
+  ],
+  "tools": [
+    {
+      "name": "get_weather",
+      "description": "Get current weather for a location",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "location": {
+            "type": "string"
+          }
+        },
+        "required": ["location"]
+      }
+    }
+  ]
+}

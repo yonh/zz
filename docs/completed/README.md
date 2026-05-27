@@ -23,3 +23,4 @@ completed 文档不是废弃文档，而是防重复记录。
 ## 当前入口
 - [backend-fix/](./backend-fix/)
 - [code-remediation/](./code-remediation/)
+- [api-converter/](./api-converter/) - API Converter 协议转换实现（P1-P9 完成，2026-05-04）

@@ -90,6 +90,12 @@ fn extract_request_id(path: &str, prefix: &str) -> Option<String> {
     Some(rest[..end].to_string())
 }
 
+fn extract_sample_id(path: &str, prefix: &str) -> Option<u64> {
+    let rest = path.strip_prefix(prefix)?;
+    let end = rest.find('/').unwrap_or(rest.len());
+    rest[..end].parse().ok()
+}
+
 /// Check if the request is authenticated for admin API access.
 ///
 /// Returns true if:
@@ -361,6 +367,8 @@ async fn handle_get_provider(name: &str, state: &crate::proxy::AppState, origin:
         "models": provider_config.map(|p| p.models.clone()).unwrap_or_default(),
         "headers": provider_config.map(|p| p.headers.clone()).unwrap_or_default(),
         "token_budget": serde_json::Value::Null,
+        "api_type": provider_config.map(|p| p.api_type.clone()).unwrap_or("auto".to_string()),
+        "enable_conversion_fallback": provider_config.map(|p| p.enable_conversion_fallback).unwrap_or(true),
         "status": if !stats.enabled { "disabled" } else { stats.state.as_str() },
         "cooldown_until": serde_json::Value::Null,
         "consecutive_failures": stats.failure_count,
@@ -433,6 +441,8 @@ async fn handle_add_provider(
         headers: add_req.headers,
         token_budget: None,
         enabled: true,
+        api_type: "auto".to_string(),
+        enable_conversion_fallback: true,
     };
 
     match state.provider_manager.add_provider(new_config.clone()) {
@@ -449,6 +459,8 @@ async fn handle_add_provider(
                 "models": new_config.models,
                 "headers": new_config.headers,
                 "token_budget": serde_json::Value::Null,
+                "api_type": new_config.api_type,
+                "enable_conversion_fallback": new_config.enable_conversion_fallback,
                 "status": "healthy",
                 "cooldown_until": serde_json::Value::Null,
                 "consecutive_failures": 0,
@@ -1243,8 +1255,8 @@ async fn handle_export_request_journal(
                 for entry in &entries {
                     summaries.push(crate::request_journal::format_timing_summary(entry));
                 }
-                let text = summaries.join("\n\n---\n\n");
-                let mut resp = hyper::Response::new(full(text));
+                let summary = summaries.join("\n\n");
+                let mut resp = hyper::Response::new(full(summary));
                 resp.headers_mut().insert(
                     hyper::header::CONTENT_TYPE,
                     "text/plain; charset=utf-8".parse().unwrap(),
@@ -1274,4 +1286,96 @@ async fn handle_export_request_journal(
         }
         Err(e) => error_response(&e, hyper::StatusCode::INTERNAL_SERVER_ERROR, state, origin),
     }
+}
+
+// ... (rest of the code remains the same)
+
+async fn handle_get_conversion_events(
+    uri: &hyper::Uri,
+    state: &crate::proxy::AppState,
+    origin: Option<&str>,
+) -> hyper::Response<ResponseBody> {
+    let params = parse_query_params(uri);
+    
+    let since = params.get("since").and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.with_timezone(&chrono::Utc));
+    
+    let kind = params.get("kind").and_then(|k| match k.as_str() {
+        "success" => Some(crate::converter::telemetry::EventKind::Success),
+        "field_skipped" => Some(crate::converter::telemetry::EventKind::FieldSkipped),
+        "unknown_field" => Some(crate::converter::telemetry::EventKind::UnknownField),
+        "fallback" => Some(crate::converter::telemetry::EventKind::Fallback),
+        "error" => Some(crate::converter::telemetry::EventKind::Error),
+        _ => None,
+    });
+    
+    let limit = params.get("limit")
+        .and_then(|l| l.parse::<usize>().ok())
+        .unwrap_or(100);
+    
+    let events = state.telemetry.get_events(since, kind, limit).await;
+    
+    json_response(&events, state, origin)
+}
+
+async fn handle_get_conversion_samples(
+    uri: &hyper::Uri,
+    state: &crate::proxy::AppState,
+    origin: Option<&str>,
+) -> hyper::Response<ResponseBody> {
+    let params = parse_query_params(uri);
+    
+    if let Some(signature) = params.get("signature") {
+        if let Some(sample) = state.telemetry.get_samples_by_signature(signature) {
+            return json_response(&sample, state, origin);
+        }
+        return not_found_response("Sample not found", state, origin);
+    }
+    
+    // Return all samples as a list
+    let samples: Vec<_> = state.telemetry.get_coverage().unknown_field_counts
+        .into_iter()
+        .map(|(field, count)| serde_json::json!({
+            "field": field,
+            "count": count,
+        }))
+        .collect();
+    
+    json_response(&serde_json::json!({
+        "samples": samples,
+        "total": samples.len()
+    }), state, origin)
+}
+
+async fn handle_get_conversion_sample_body(
+    sample_id: u64,
+    state: &crate::proxy::AppState,
+    origin: Option<&str>,
+) -> hyper::Response<ResponseBody> {
+    if let Some((request_body, response_body)) = state.telemetry.get_sample_body(sample_id) {
+        return json_response(&serde_json::json!({
+            "request_body": request_body,
+            "response_body": response_body,
+        }), state, origin);
+    }
+    
+    not_found_response("Sample body not found", state, origin)
+}
+
+async fn handle_get_conversion_coverage(
+    state: &crate::proxy::AppState,
+    origin: Option<&str>,
+) -> hyper::Response<ResponseBody> {
+    let coverage = state.telemetry.get_coverage();
+    json_response(&coverage, state, origin)
+}
+
+async fn handle_clear_conversion_samples(
+    state: &crate::proxy::AppState,
+    origin: Option<&str>,
+) -> hyper::Response<ResponseBody> {
+    state.telemetry.clear_samples();
+    json_response(&serde_json::json!({
+        "message": "All conversion samples cleared"
+    }), state, origin)
 }

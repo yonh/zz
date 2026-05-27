@@ -31,6 +31,7 @@
 
 - `backend-fix/` - 已完成的后端修复
 - `code-remediation/` - 已完成的代码整改批次
+- `api-converter/` - API Converter 协议转换实现（P1-P9 完成，2026-05-04）
 
 ### [process/](./process/)
 跨任务流程文档，说明任务如何流转、如何使用 Windsurf workflow、如何做审核与归档。

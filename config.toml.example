@@ -52,15 +52,47 @@ error_sampling = 1.0         # Error request sampling rate (100%)
 storage_dir = "logs/traces"
 retention_days = 3
 
+# Conversion log level (affects zz::conversion target only)
+# Default: "info"
+conversion_log_level = "info"
+
+[observability.telemetry]
+# Conversion telemetry for field mapping iteration loop
+# Enables structured event collection for discovering missing field mappings
+enabled = true
+sample_max_count = 10000          # Sample limit (FIFO eviction)
+sample_max_bytes = 67108864       # 64 MiB memory limit
+sample_resave_every = 100         # Resave body every N hits for same signature
+persist_path = ""                 # Empty = in-memory only; non-empty = JSONL path
+unknown_field_log_level = "warn"  # debug/info/warn for unknown fields
+redact_extra_headers = []         # Additional headers to redact in samples
+
 # --- Providers ---
 
 [[providers]]
-name = "example-provider"
-base_url = "https://api.example.com/v1"
-api_key = "sk-your-api-key-here"
+name = "anthropic-provider"
+base_url = "https://api.anthropic.com/v1"
+api_key = "sk-ant-your-api-key-here"
 priority = 1
 weight = 1
-models = ["gpt-4", "gpt-3.5-turbo"]
+models = ["claude-3-opus", "claude-3-sonnet", "claude-3-haiku"]
+# api_type: "anthropic" | "openai-chat" | "openai-responses" | "auto" (default)
+# Determines which API format the provider expects. "auto" defaults to "openai-chat".
+api_type = "anthropic"
+# enable_conversion_fallback: When true, response-side conversion failures pass through upstream body.
+# When false, response-side failures return 502 error.
+enable_conversion_fallback = true
+
+[[providers]]
+name = "openai-chat-provider"
+base_url = "https://api.openai.com/v1"
+api_key = "sk-your-openai-key-here"
+priority = 2
+weight = 1
+models = ["gpt-4", "gpt-4-turbo", "gpt-3.5-turbo"]
+# This provider uses OpenAI Chat format - suitable for /a2o/* conversion routes
+api_type = "openai-chat"
+enable_conversion_fallback = true
 
 # [[providers]]
 # name = "second-provider"

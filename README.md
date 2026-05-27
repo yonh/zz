@@ -14,6 +14,85 @@
 - **🌐 模型路由规则**：基于模型名称的智能路由
 - **📈 Token统计**：详细的Token使用量跟踪（支持OpenAI/Anthropic格式）
 - **🔍 请求日志**：完整的请求响应日志记录
+- **🔀 协议转换**：支持Anthropic、OpenAI等不同API格式之间的透明转换
+
+## 🔀 协议转换
+
+ZZ支持在不同LLM API格式之间进行协议转换，使客户端可以使用一种API格式访问使用另一种格式的提供商。
+
+### 支持的转换前缀
+
+| 前缀 | 转换方向 | 状态 |
+|------|----------|------|
+| `/v1/*` | 透明代理（无转换） | ✅ 已支持 |
+| `/a2o/v1/*` | Anthropic → OpenAI Chat | ✅ 已支持 |
+| `/o2a/v1/*` | OpenAI Chat → Anthropic | ✅ 已支持 |
+| `/a2r/v1/*` | Anthropic → OpenAI Responses | 🚧 计划中 |
+| `/r2a/v1/*` | OpenAI Responses → Anthropic | 🚧 计划中 |
+
+### 使用示例
+
+**Claude Code 原生兼容模式（推荐）：**
+
+启用兼容模式后，Claude Code 可以直接使用 OpenAI 提供商，无需修改端点路径：
+
+```toml
+[compat.claude_code_openai]
+enabled = true
+```
+
+配置 Claude Code：
+```bash
+ANTHROPIC_BASE_URL=http://127.0.0.1:9090
+```
+
+Claude Code 会发送请求到 `/v1/messages`，代理会自动转换为 OpenAI 格式。
+
+**显式转换前缀模式：**
+
+**Anthropic客户端 → OpenAI提供商：**
+
+```bash
+curl -X POST http://127.0.0.1:9090/a2o/v1/messages \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-3-sonnet-20240229",
+    "max_tokens": 1024,
+    "messages": [{"role": "user", "content": "Hello"}]
+  }'
+```
+
+**OpenAI客户端 → Anthropic提供商：**
+
+```bash
+curl -X POST http://127.0.0.1:9090/o2a/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-4",
+    "messages": [{"role": "user", "content": "Hello"}]
+  }'
+```
+
+### 配置提供商API类型
+
+在`config.toml`中指定提供商的API类型：
+
+```toml
+[[providers]]
+name = "openai-provider"
+base_url = "https://api.openai.com/v1"
+api_key = "sk-your-key"
+api_type = "openai-chat"  # 或 "anthropic", "auto"
+enable_conversion_fallback = true  # 响应侧错误时透传
+```
+
+### 详细文档
+
+- [开发者指南](docs/dev/api-converter.md) - 架构、扩展指南、错误处理
+- [手动验收](docs/active-work/api-converter/manual-acceptance.md) - 验证步骤
+- [路由矩阵](docs/plans/2026-05-04-api-converter-plan/route-matrix.md) - 路由前缀语义
+- [字段映射](docs/plans/2026-05-04-api-converter-plan/field-mapping.md) - 详细字段映射规则
+- [错误模型](docs/plans/2026-05-04-api-converter-plan/error-model.md) - 错误处理策略
 
 ## 🚀 快速开始
 

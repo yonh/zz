@@ -4,10 +4,14 @@ use tracing_subscriber::prelude::*;
 
 pub fn init_logging(
     log_level: &str,
+    conversion_log_level: &str,
     trace_layer: Option<crate::trace_layer::JournalTraceLayer>,
 ) -> Result<(), anyhow::Error> {
     let filter = EnvFilter::try_from_default_env()
-        .or_else(|_| EnvFilter::try_new(log_level))?;
+        .unwrap_or_else(|_| {
+            EnvFilter::new(log_level)
+                .add_directive(format!("zz::conversion={}", conversion_log_level).parse().unwrap())
+        });
 
     let fmt_layer = tracing_subscriber::fmt::layer()
         .with_writer(std::io::stderr);

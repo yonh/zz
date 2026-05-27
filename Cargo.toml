@@ -2,6 +2,19 @@
 name = "zz"
 version = "0.1.0"
 edition = "2021"
+default-run = "zz"
+
+[lib]
+name = "zz"
+path = "src/lib.rs"
+
+[[bin]]
+name = "zz"
+path = "src/main.rs"
+
+[[bin]]
+name = "convert-replay"
+path = "src/bin/convert_replay.rs"
 
 [dependencies]
 tokio = { version = "1.37", features = ["full", "macros", "net", "rt-multi-thread", "time"], default-features = false }
@@ -32,6 +45,8 @@ futures-core = "0.3.32"
 serde_json = "1.0.149"
 tokio-tungstenite = "0.26"
 base64 = "0.22"
+sha1 = "0.10"
+uuid = { version = "1.8", features = ["v4"] }
 
 [dev-dependencies]
 tempfile = "3"

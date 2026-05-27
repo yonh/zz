@@ -1,0 +1,9 @@
+data: {"id":"chatcmpl-123","model":"gpt-4","choices":[{"index":0,"delta":{"role":"assistant"}}]}
+
+data: {"choices":[{"index":0,"delta":{"content":"Hello"}}]}
+
+data: {"choices":[{"index":0,"delta":{"content":" world"}}]}
+
+data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"completion_tokens":3}}
+
+data: [DONE]

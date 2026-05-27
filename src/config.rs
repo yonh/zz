@@ -1,5 +1,7 @@
 use serde::Deserialize;
 
+use crate::converter::ApiType;
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     pub server: ServerConfig,
@@ -11,6 +13,8 @@ pub struct Config {
     pub observability: ObservabilityConfig,
     #[serde(default)]
     pub admin: AdminConfig,
+    #[serde(default)]
+    pub compat: CompatConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -33,8 +37,32 @@ impl Default for AdminConfig {
     }
 }
 
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct CompatConfig {
+    #[serde(default)]
+    pub claude_code_openai: ClaudeCodeOpenAICompatConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ClaudeCodeOpenAICompatConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_claude_code_match_paths")]
+    pub match_paths: Vec<String>,
+    #[serde(default = "default_claude_code_target_api")]
+    pub target_api_type: String,
+}
+
 fn default_allowed_origins() -> Vec<String> {
     vec!["http://localhost:*".to_string()]
+}
+
+fn default_claude_code_match_paths() -> Vec<String> {
+    vec!["/v1/messages".to_string()]
+}
+
+fn default_claude_code_target_api() -> String {
+    "openai-chat".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -45,6 +73,12 @@ pub struct ObservabilityConfig {
     pub timing: TimingConfig,
     #[serde(default)]
     pub tracing: TracingConfig,
+    #[serde(default)]
+    pub log_level: String,
+    #[serde(default = "default_conversion_log_level")]
+    pub conversion_log_level: String,
+    #[serde(default)]
+    pub telemetry: crate::converter::telemetry::TelemetryConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -226,10 +260,57 @@ pub struct ProviderConfig {
     pub token_budget: Option<u64>,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+    #[serde(default = "default_api_type")]
+    pub api_type: String,
+    #[serde(default = "default_true")]
+    pub enable_conversion_fallback: bool,
+}
+
+impl ProviderConfig {
+    /// Resolve the api_type string to an ApiType enum.
+    /// Invalid values are treated as "auto" (which defaults to OpenAIChat for now).
+    /// Logs a warning once for invalid values.
+    pub fn resolved_api_type(&self) -> ApiType {
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        
+        match self.api_type.as_str() {
+            "anthropic" => ApiType::Anthropic,
+            "openai-chat" => ApiType::OpenAIChat,
+            "openai-responses" => ApiType::OpenAIResponses,
+            "" | "auto" => {
+                // First version: auto defaults to OpenAIChat
+                ApiType::OpenAIChat
+            }
+            _ => {
+                // Invalid value - warn once and treat as auto
+                if !WARNED.load(std::sync::atomic::Ordering::Relaxed) {
+                    tracing::warn!(
+                        provider = %self.name,
+                        api_type = %self.api_type,
+                        "Invalid api_type, treating as 'auto' (OpenAIChat)"
+                    );
+                    WARNED.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                ApiType::OpenAIChat
+            }
+        }
+    }
 }
 
 fn default_enabled() -> bool {
     true
+}
+
+fn default_api_type() -> String {
+    "auto".to_string()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_conversion_log_level() -> String {
+    "info".to_string()
 }
 
 fn default_listen() -> String {
@@ -297,5 +378,217 @@ impl Config {
         }
 
         Ok(config)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_old_config_loads_with_defaults() {
+        let old_config_toml = r#"
+[server]
+listen = "127.0.0.1:9090"
+request_timeout_secs = 300
+log_level = "info"
+
+[admin]
+enabled = false
+api_key = ""
+allowed_origins = ["http://localhost:*"]
+
+[routing]
+strategy = "round-robin"
+retry_on_failure = true
+max_retries = 3
+
+[health]
+failure_threshold = 3
+recovery_secs = 600
+cooldown_secs = 60
+
+[observability.timing]
+enabled = true
+
+[observability.request_journal]
+enabled = true
+storage_dir = "logs/request-journal"
+retention_days = 7
+
+[observability.tracing]
+enabled = false
+
+[[providers]]
+name = "test-provider"
+base_url = "https://api.example.com/v1"
+api_key = "sk-test-key"
+priority = 1
+weight = 1
+models = ["gpt-4"]
+"#;
+
+        let config = Config::load_from_str(old_config_toml).expect("Old config should load");
+        
+        assert_eq!(config.observability.conversion_log_level, "info");
+        
+        let provider = &config.provider_configs[0];
+        assert_eq!(provider.api_type, "auto");
+        assert_eq!(provider.enable_conversion_fallback, true);
+    }
+
+    #[test]
+    fn test_api_type_anthropic() {
+        let config_toml = r#"
+[server]
+listen = "127.0.0.1:9090"
+log_level = "info"
+
+[admin]
+enabled = false
+api_key = ""
+allowed_origins = ["http://localhost:*"]
+
+[routing]
+strategy = "round-robin"
+retry_on_failure = true
+max_retries = 3
+
+[health]
+failure_threshold = 3
+recovery_secs = 600
+cooldown_secs = 60
+
+[[providers]]
+name = "anthropic-provider"
+base_url = "https://api.anthropic.com/v1"
+api_key = "sk-test"
+priority = 1
+weight = 1
+models = ["claude-3-opus"]
+api_type = "anthropic"
+"#;
+
+        let config = Config::load_from_str(config_toml).expect("Config should load");
+        let provider = &config.provider_configs[0];
+        
+        assert_eq!(provider.api_type, "anthropic");
+        assert_eq!(provider.resolved_api_type(), ApiType::Anthropic);
+    }
+
+    #[test]
+    fn test_api_type_openai_chat() {
+        let config_toml = r#"
+[server]
+listen = "127.0.0.1:9090"
+log_level = "info"
+
+[admin]
+enabled = false
+api_key = ""
+allowed_origins = ["http://localhost:*"]
+
+[routing]
+strategy = "round-robin"
+retry_on_failure = true
+max_retries = 3
+
+[health]
+failure_threshold = 3
+recovery_secs = 600
+cooldown_secs = 60
+
+[[providers]]
+name = "openai-provider"
+base_url = "https://api.openai.com/v1"
+api_key = "sk-test"
+priority = 1
+weight = 1
+models = ["gpt-4"]
+api_type = "openai-chat"
+"#;
+
+        let config = Config::load_from_str(config_toml).expect("Config should load");
+        let provider = &config.provider_configs[0];
+        
+        assert_eq!(provider.api_type, "openai-chat");
+        assert_eq!(provider.resolved_api_type(), ApiType::OpenAIChat);
+    }
+
+    #[test]
+    fn test_api_type_invalid() {
+        let config_toml = r#"
+[server]
+listen = "127.0.0.1:9090"
+log_level = "info"
+
+[admin]
+enabled = false
+api_key = ""
+allowed_origins = ["http://localhost:*"]
+
+[routing]
+strategy = "round-robin"
+retry_on_failure = true
+max_retries = 3
+
+[health]
+failure_threshold = 3
+recovery_secs = 600
+cooldown_secs = 60
+
+[[providers]]
+name = "invalid-provider"
+base_url = "https://api.example.com/v1"
+api_key = "sk-test"
+priority = 1
+weight = 1
+models = ["gpt-4"]
+api_type = "invalid-type"
+"#;
+
+        let config = Config::load_from_str(config_toml).expect("Config should load");
+        let provider = &config.provider_configs[0];
+        
+        assert_eq!(provider.api_type, "invalid-type");
+        assert_eq!(provider.resolved_api_type(), ApiType::OpenAIChat);
+    }
+
+    #[test]
+    fn test_conversion_log_level() {
+        let config_toml = r#"
+[server]
+listen = "127.0.0.1:9090"
+log_level = "info"
+
+[admin]
+enabled = false
+api_key = ""
+allowed_origins = ["http://localhost:*"]
+
+[routing]
+strategy = "round-robin"
+retry_on_failure = true
+max_retries = 3
+
+[health]
+failure_threshold = 3
+recovery_secs = 600
+cooldown_secs = 60
+
+[observability]
+conversion_log_level = "debug"
+
+[[providers]]
+name = "test-provider"
+base_url = "https://api.example.com/v1"
+api_key = "sk-test"
+priority = 1
+weight = 1
+models = ["gpt-4"]
+"#;
+
+        let config = Config::load_from_str(config_toml).expect("Config should load");
+        assert_eq!(config.observability.conversion_log_level, "debug");
     }
 }

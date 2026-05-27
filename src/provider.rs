@@ -239,6 +239,65 @@ impl ProviderManager {
             .collect()
     }
 
+    /// Select available providers filtered by target API type.
+    /// Used for conversion routing where the target provider must support the target API type.
+    ///
+    /// # Arguments
+    /// * `target` - Target API type (Anthropic, OpenAIChat, etc.)
+    /// * `model` - Model name to filter by (optional, if None returns all matching providers)
+    ///
+    /// # Returns
+    /// Vector of (provider_name, provider) tuples matching the target API type, or None if no matches
+    pub fn select_for_target(
+        &self,
+        target: crate::converter::ApiType,
+        model: Option<&str>,
+    ) -> Option<Vec<(String, Arc<Provider>)>> {
+        let providers: Vec<_> = self
+            .providers
+            .iter()
+            .filter(|entry| {
+                let p = entry.value();
+                if !p.is_available() {
+                    return false;
+                }
+
+                // Check if provider's resolved api_type matches target
+                let config = p.config.read().unwrap();
+                let provider_api_type = config.resolved_api_type();
+                
+                // Strict matching: target=OpenAIChat only matches api_type ∈ {"openai-chat","auto"}
+                // target=Anthropic only matches api_type ∈ {"anthropic","auto"}
+                // auto resolves to OpenAIChat (first version per plan)
+                let matches_type = match (provider_api_type, target) {
+                    (crate::converter::ApiType::OpenAIChat, crate::converter::ApiType::OpenAIChat) => true,
+                    (crate::converter::ApiType::Anthropic, crate::converter::ApiType::Anthropic) => true,
+                    (provider_type, target_type) => provider_type == target_type,
+                };
+                
+                if !matches_type {
+                    return false;
+                }
+
+                // Check model support if specified
+                if let Some(model_name) = model {
+                    if !p.supports_model(model_name) {
+                        return false;
+                    }
+                }
+
+                true
+            })
+            .map(|entry| (entry.key().clone(), Arc::clone(entry.value())))
+            .collect();
+
+        if providers.is_empty() {
+            None
+        } else {
+            Some(providers)
+        }
+    }
+
     pub fn get_by_name(&self, name: &str) -> Option<Arc<Provider>> {
         self.providers.get(name).map(|entry| Arc::clone(entry.value()))
     }
@@ -426,4 +485,170 @@ pub struct ProviderConfigUpdate {
     pub models: Option<Vec<String>>,
     pub headers: Option<std::collections::HashMap<String, String>>,
     pub token_budget: Option<Option<u64>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_select_for_target_openai_chat_matches_only_openai_chat_providers() {
+        let config = crate::config::Config::load_from_str(r#"
+[server]
+listen = "127.0.0.1:9090"
+log_level = "info"
+
+[admin]
+enabled = false
+api_key = ""
+allowed_origins = ["http://localhost:*"]
+
+[routing]
+strategy = "failover"
+retry_on_failure = true
+max_retries = 3
+
+[health]
+failure_threshold = 3
+recovery_secs = 600
+cooldown_secs = 60
+
+[[providers]]
+name = "openai-provider"
+base_url = "https://api.openai.com/v1"
+api_key = "sk-test"
+api_type = "openai-chat"
+models = ["gpt-4"]
+
+[[providers]]
+name = "anthropic-provider"
+base_url = "https://api.anthropic.com/v1"
+api_key = "sk-test"
+api_type = "anthropic"
+models = ["claude-3-opus"]
+
+[[providers]]
+name = "auto-provider"
+base_url = "https://api.example.com/v1"
+api_key = "sk-test"
+api_type = "auto"
+models = ["*"]
+"#).unwrap();
+
+        let manager = ProviderManager::new(&config);
+
+        // Target OpenAIChat should only match openai-chat and auto providers
+        let result = manager.select_for_target(crate::converter::ApiType::OpenAIChat, None);
+        assert!(result.is_some());
+        let providers = result.unwrap();
+        assert_eq!(providers.len(), 2);
+        let provider_names: Vec<_> = providers.iter().map(|(name, _)| name.clone()).collect();
+        assert!(provider_names.contains(&"openai-provider".to_string()));
+        assert!(provider_names.contains(&"auto-provider".to_string()));
+        assert!(!provider_names.contains(&"anthropic-provider".to_string()));
+    }
+
+    #[test]
+    fn test_select_for_target_anthropic_matches_only_anthropic_providers() {
+        let config = crate::config::Config::load_from_str(r#"
+[server]
+listen = "127.0.0.1:9090"
+log_level = "info"
+
+[admin]
+enabled = false
+api_key = ""
+allowed_origins = ["http://localhost:*"]
+
+[routing]
+strategy = "failover"
+retry_on_failure = true
+max_retries = 3
+
+[health]
+failure_threshold = 3
+recovery_secs = 600
+cooldown_secs = 60
+
+[[providers]]
+name = "openai-provider"
+base_url = "https://api.openai.com/v1"
+api_key = "sk-test"
+api_type = "openai-chat"
+models = ["gpt-4"]
+
+[[providers]]
+name = "anthropic-provider"
+base_url = "https://api.anthropic.com/v1"
+api_key = "sk-test"
+api_type = "anthropic"
+models = ["claude-3-opus"]
+
+[[providers]]
+name = "auto-provider"
+base_url = "https://api.example.com/v1"
+api_key = "sk-test"
+api_type = "auto"
+models = ["*"]
+"#).unwrap();
+
+        let manager = ProviderManager::new(&config);
+
+        // Target Anthropic should only match anthropic providers
+        let result = manager.select_for_target(crate::converter::ApiType::Anthropic, None);
+        assert!(result.is_some());
+        let providers = result.unwrap();
+        assert_eq!(providers.len(), 1);
+        let provider_names: Vec<_> = providers.iter().map(|(name, _)| name.clone()).collect();
+        assert!(provider_names.contains(&"anthropic-provider".to_string()));
+        assert!(!provider_names.contains(&"openai-provider".to_string()));
+        assert!(!provider_names.contains(&"auto-provider".to_string()));
+    }
+
+    #[test]
+    fn test_select_for_target_with_model_filter() {
+        let config = crate::config::Config::load_from_str(r#"
+[server]
+listen = "127.0.0.1:9090"
+log_level = "info"
+
+[admin]
+enabled = false
+api_key = ""
+allowed_origins = ["http://localhost:*"]
+
+[routing]
+strategy = "failover"
+retry_on_failure = true
+max_retries = 3
+
+[health]
+failure_threshold = 3
+recovery_secs = 600
+cooldown_secs = 60
+
+[[providers]]
+name = "openai-provider"
+base_url = "https://api.openai.com/v1"
+api_key = "sk-test"
+api_type = "openai-chat"
+models = ["gpt-4"]
+
+[[providers]]
+name = "openai-gpt3"
+base_url = "https://api.openai.com/v1"
+api_key = "sk-test"
+api_type = "openai-chat"
+models = ["gpt-3.5-turbo"]
+"#).unwrap();
+
+        let manager = ProviderManager::new(&config);
+
+        // Target OpenAIChat with model filter should only match providers supporting that model
+        let result = manager.select_for_target(crate::converter::ApiType::OpenAIChat, Some("gpt-4"));
+        assert!(result.is_some());
+        let providers = result.unwrap();
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].0, "openai-provider");
+    }
 }

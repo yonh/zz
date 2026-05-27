@@ -13,6 +13,7 @@ mod admin_api;
 mod ws;
 mod request_journal;
 mod trace_layer;
+mod converter;
 
 use clap::Parser;
 use std::sync::Arc;
@@ -70,7 +71,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         (None, None)
     };
-    logging::init_logging(&cfg.server.log_level, trace_layer)?;
+    logging::init_logging(&cfg.server.log_level, &cfg.observability.conversion_log_level, trace_layer)?;
 
     tracing::info!(listen = %cfg.server.listen, "Starting ZZ proxy");
 
@@ -90,6 +91,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let request_journal = Arc::new(request_journal::RequestJournalWriter::new(
         cfg.observability.request_journal.clone()
     ));
+
+    // Initialize telemetry
+    let converter_version = env!("CONVERTER_VERSION");
+    let telemetry = Arc::new(crate::converter::telemetry::InMemoryTelemetry::new(
+        cfg.observability.telemetry.clone(),
+        converter_version,
+    ));
+
     let start_time = Instant::now();
 
     // Create shared HTTP client with connection pool for TLS reuse
@@ -120,6 +129,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         last_reloaded: Arc::new(std::sync::Mutex::new(None)),
         trace_sampler,
         http_client,
+        telemetry,
     };
 
     // Create server
@@ -269,7 +279,100 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
 
-                            // Handle proxy request
+                            // Route conversion prefixes (must be checked before /v1/*)
+                            // Order matters per route-matrix.md §3
+                            if path.starts_with("/a2o/v1/") {
+                                // Anthropic → OpenAI Chat
+                                return match proxy::conversion_proxy_handler(req, state, crate::converter::ApiType::Anthropic, crate::converter::ApiType::OpenAIChat).await {
+                                    Ok(resp) => Ok(resp),
+                                    Err(e) => {
+                                        tracing::error!(error = ?e, "Conversion proxy error");
+                                        Ok(hyper::Response::builder()
+                                            .status(hyper::StatusCode::INTERNAL_SERVER_ERROR)
+                                            .body(full(format!("Conversion proxy error: {}", e)))
+                                            .unwrap())
+                                    }
+                                };
+                            }
+                            if path.starts_with("/o2a/v1/") {
+                                // OpenAI Chat → Anthropic
+                                return match proxy::conversion_proxy_handler(req, state, crate::converter::ApiType::OpenAIChat, crate::converter::ApiType::Anthropic).await {
+                                    Ok(resp) => Ok(resp),
+                                    Err(e) => {
+                                        tracing::error!(error = ?e, "Conversion proxy error");
+                                        Ok(hyper::Response::builder()
+                                            .status(hyper::StatusCode::INTERNAL_SERVER_ERROR)
+                                            .body(full(format!("Conversion proxy error: {}", e)))
+                                            .unwrap())
+                                    }
+                                };
+                            }
+                            if path.starts_with("/a2r/") || path.starts_with("/r2a/") || path.starts_with("/anthropic/") || path.starts_with("/openai/") || path.starts_with("/responses/") {
+                                // Not implemented yet - return 501
+                                let prefix = path.split('/').nth(1).unwrap_or("unknown");
+                                let error_body = serde_json::json!({
+                                    "error": {
+                                        "type": "not_implemented_error",
+                                        "message": format!("Conversion prefix not implemented yet: {}", prefix)
+                                    }
+                                });
+                                return Ok::<_, hyper::Error>(
+                                    hyper::Response::builder()
+                                        .status(hyper::StatusCode::NOT_IMPLEMENTED)
+                                        .header("content-type", "application/json")
+                                        .body(full(error_body.to_string()))
+                                        .unwrap()
+                                );
+                            }
+
+                            // Handle regular proxy request (/v1/*)
+                            // Check for Claude Code compatibility mode first
+                            let should_use_compat = {
+                                let config = state.config.read().unwrap();
+                                let compat = &config.compat.claude_code_openai;
+                                if compat.enabled && compat.match_paths.contains(&path) {
+                                    // Check for anthropic-version header (highest priority)
+                                    let has_anthropic_header = req.headers().get("anthropic-version").is_some();
+                                    if has_anthropic_header {
+                                        Some(compat.target_api_type.clone())
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                }
+                            };
+
+                            if let Some(target_api_str) = should_use_compat {
+                                // Parse target API type
+                                let target_api = match target_api_str.as_str() {
+                                    "openai-chat" => crate::converter::ApiType::OpenAIChat,
+                                    "anthropic" => crate::converter::ApiType::Anthropic,
+                                    _ => {
+                                        tracing::error!(target_api = %target_api_str, "Invalid target API type in compatibility mode");
+                                        return Ok::<_, hyper::Error>(
+                                            hyper::Response::builder()
+                                                .status(hyper::StatusCode::INTERNAL_SERVER_ERROR)
+                                                .body(full("Invalid target API type in compatibility mode"))
+                                                .unwrap()
+                                        );
+                                    }
+                                };
+
+                                // Route to conversion handler with Anthropic -> target_api
+                                return match proxy::conversion_proxy_handler(req, state, crate::converter::ApiType::Anthropic, target_api).await {
+                                    Ok(resp) => Ok(resp),
+                                    Err(e) => {
+                                        tracing::error!(error = ?e, "Compatibility mode conversion error");
+                                        Ok(hyper::Response::builder()
+                                            .status(hyper::StatusCode::INTERNAL_SERVER_ERROR)
+                                            .body(full(format!("Compatibility mode conversion error: {}", e)))
+                                            .unwrap())
+                                    }
+                                };
+                            }
+
+                            // Default: regular transparent proxy
                             match proxy::proxy_handler(req, state).await {
                                 Ok(resp) => Ok(resp),
                                 Err(e) => {
