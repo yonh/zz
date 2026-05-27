@@ -254,7 +254,7 @@ fn convert_input_item(item: &Value) -> Result<Value, ConversionError> {
             let role = item.get("role").and_then(|v| v.as_str()).unwrap_or("user");
             // Responses API "developer" role == Chat API "system" role
             let chat_role = if role == "developer" { "system" } else { role };
-            let content = extract_content_text(item);
+            let content = extract_content(item);
             Ok(json!({"role": chat_role, "content": content}))
         }
         "function_call" => {
@@ -297,28 +297,60 @@ fn convert_input_item(item: &Value) -> Result<Value, ConversionError> {
     }
 }
 
-/// Extract text content from a Responses message item
-fn extract_content_text(item: &Value) -> String {
+/// Extract content from a Responses message item.
+/// Returns a Chat-compatible content value (string or array).
+fn extract_content(item: &Value) -> Value {
     if let Some(content) = item.get("content") {
         if let Some(s) = content.as_str() {
-            return s.to_string();
+            return json!(s);
         }
         if let Some(arr) = content.as_array() {
-            let parts: Vec<String> = arr.iter().filter_map(|c| {
-                if c.get("type").and_then(|v| v.as_str()) == Some("input_text") {
-                    c.get("text").and_then(|t| t.as_str()).map(String::from)
-                } else if c.get("type").and_then(|v| v.as_str()) == Some("output_text") {
-                    c.get("text").and_then(|t| t.as_str()).map(String::from)
-                } else {
-                    None
+            // Check if there are any non-text items (images, etc.)
+            let has_media = arr.iter().any(|c| {
+                matches!(c.get("type").and_then(|v| v.as_str()), Some("input_image"))
+            });
+
+            if has_media {
+                // Build multimodal content array for Chat API
+                let parts: Vec<Value> = arr.iter().filter_map(|c| {
+                    let ctype = c.get("type").and_then(|v| v.as_str()).unwrap_or("input_text");
+                    match ctype {
+                        "input_text" | "output_text" => {
+                            c.get("text").and_then(|t| t.as_str()).map(|text| {
+                                json!({"type": "text", "text": text})
+                            })
+                        }
+                        "input_image" => {
+                            // Responses: {"type": "input_image", "image_url": "https://..."}
+                            // Chat: {"type": "image_url", "image_url": {"url": "https://..."}}
+                            let url = c.get("image_url").and_then(|u| u.as_str())
+                                .or_else(|| c.get("image_url").and_then(|u| u.get("url")).and_then(|u| u.as_str()))
+                                .unwrap_or("");
+                            Some(json!({
+                                "type": "image_url",
+                                "image_url": {"url": url}
+                            }))
+                        }
+                        _ => None,
+                    }
+                }).collect();
+                if !parts.is_empty() {
+                    return json!(parts);
                 }
-            }).collect();
-            if !parts.is_empty() {
-                return parts.join("");
+            } else {
+                // Text-only — concatenate as string
+                let text: String = arr.iter().filter_map(|c| {
+                    if matches!(c.get("type").and_then(|v| v.as_str()), Some("input_text") | Some("output_text")) {
+                        c.get("text").and_then(|t| t.as_str())
+                    } else {
+                        None
+                    }
+                }).collect();
+                return json!(text);
             }
         }
     }
-    String::new()
+    json!("")
 }
 
 /// Map Chat API finish_reason to Responses API stop_reason

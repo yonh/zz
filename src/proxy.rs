@@ -798,8 +798,9 @@ pub async fn conversion_proxy_handler(
     // When source == target, no conversion is needed (pass-through mode)
     let converted_body = if source == target {
         Ok(body_bytes.clone())
-    } else { match source {
-        crate::converter::ApiType::Anthropic => {
+    } else { match (source, target) {
+        // Direct conversions
+        (crate::converter::ApiType::Anthropic, crate::converter::ApiType::OpenAIChat) => {
             let converter = &crate::converter::AnthropicToOpenAIConverter;
             if let Some(ref ctx) = telemetry_ctx {
                 converter.convert_request_with_ctx(&body_bytes, crate::converter::TargetQuirks::default(), ctx.as_ref())
@@ -807,28 +808,47 @@ pub async fn conversion_proxy_handler(
                 converter.convert_request(&body_bytes, target)
             }
         }
-        crate::converter::ApiType::OpenAIChat => {
-            if target == crate::converter::ApiType::OpenAIResponses {
-                // /c2r/: Chat → Responses request conversion
-                let converter = &crate::converter::OpenAIChatToResponsesConverter;
-                converter.convert_request(&body_bytes, target)
+        (crate::converter::ApiType::OpenAIChat, crate::converter::ApiType::Anthropic) => {
+            let converter = &crate::converter::OpenAIChatToAnthropicConverter;
+            if let Some(ref ctx) = telemetry_ctx {
+                converter.convert_request_with_ctx(&body_bytes, ctx.as_ref())
             } else {
-                let converter = &crate::converter::OpenAIChatToAnthropicConverter;
-                if let Some(ref ctx) = telemetry_ctx {
-                    converter.convert_request_with_ctx(&body_bytes, ctx.as_ref())
-                } else {
-                    converter.convert_request(&body_bytes, target)
-                }
+                converter.convert_request(&body_bytes, target)
             }
         }
-        crate::converter::ApiType::OpenAIResponses => {
+        (crate::converter::ApiType::OpenAIChat, crate::converter::ApiType::OpenAIResponses) => {
+            let converter = &crate::converter::OpenAIChatToResponsesConverter;
+            converter.convert_request(&body_bytes, target)
+        }
+        (crate::converter::ApiType::OpenAIResponses, crate::converter::ApiType::OpenAIChat) => {
             let converter = &crate::converter::OpenAIResponsesToChatConverter;
             converter.convert_request(&body_bytes, target)
+        }
+        // Chained conversions: Anthropic ↔ Responses via Chat intermediate
+        (crate::converter::ApiType::Anthropic, crate::converter::ApiType::OpenAIResponses) => {
+            // a2r: Anthropic → Chat → Responses
+            let step1 = crate::converter::AnthropicToOpenAIConverter.convert_request(&body_bytes, crate::converter::ApiType::OpenAIChat);
+            match step1 {
+                Ok(chat_bytes) => {
+                    crate::converter::OpenAIChatToResponsesConverter.convert_request(&chat_bytes, target)
+                }
+                Err(e) => Err(e)
+            }
+        }
+        (crate::converter::ApiType::OpenAIResponses, crate::converter::ApiType::Anthropic) => {
+            // r2a: Responses → Chat → Anthropic
+            let step1 = crate::converter::OpenAIResponsesToChatConverter.convert_request(&body_bytes, crate::converter::ApiType::OpenAIChat);
+            match step1 {
+                Ok(chat_bytes) => {
+                    crate::converter::OpenAIChatToAnthropicConverter.convert_request(&chat_bytes, crate::converter::ApiType::Anthropic)
+                }
+                Err(e) => Err(e)
+            }
         }
         _ => {
             return Ok(hyper::Response::builder()
                 .status(hyper::StatusCode::BAD_REQUEST)
-                .body(full("Unsupported source API type"))
+                .body(full("Unsupported source/target API type combination"))
                 .unwrap());
         }
     } };
@@ -1122,14 +1142,21 @@ pub async fn conversion_proxy_handler(
         "Upstream response"
     );
 
-    // Step 8: Select response converter based on target API type (upstream format) and convert with telemetry
-    let converted_response = match target {
-        crate::converter::ApiType::Anthropic => {
-            // target=Anthropic means upstream response is in Anthropic format.
-            // We need to convert Anthropic → source (OpenAIChat).
-            // convert_response(body, source_format, target_format, is_stream)
-            //   where source_format = format of the body passed in (upstream = target)
-            //         target_format = format to convert to (client expects = source)
+    // Step 8: Select response converter based on (source, target) pair
+    // Upstream response is in `target` format, client expects `source` format
+    let converted_response = match (source, target) {
+        // Direct conversions
+        (crate::converter::ApiType::Anthropic, crate::converter::ApiType::OpenAIChat) => {
+            // target=Chat, upstream is Chat → convert Chat → Anthropic
+            let converter = &crate::converter::OpenAIChatToAnthropicConverter;
+            if let Some(ref ctx) = telemetry_ctx {
+                converter.convert_response_with_ctx(&upstream_body_bytes, ctx.as_ref())
+            } else {
+                converter.convert_response(&upstream_body_bytes, target, source, false)
+            }
+        }
+        (crate::converter::ApiType::OpenAIChat, crate::converter::ApiType::Anthropic) => {
+            // target=Anthropic, upstream is Anthropic → convert Anthropic → Chat
             let converter = &crate::converter::AnthropicToOpenAIConverter;
             if let Some(ref ctx) = telemetry_ctx {
                 converter.convert_response_with_ctx(&upstream_body_bytes, ctx.as_ref())
@@ -1137,43 +1164,50 @@ pub async fn conversion_proxy_handler(
                 converter.convert_response(&upstream_body_bytes, target, source, false)
             }
         }
-        crate::converter::ApiType::OpenAIChat => {
-            // target=OpenAIChat means upstream response is in OpenAI format.
-            if source == crate::converter::ApiType::OpenAIResponses {
-                // /r2c/: upstream Chat → Responses for Codex
-                let converter = &crate::converter::OpenAIResponsesToChatConverter;
-                converter.convert_response(&upstream_body_bytes, target, source, false)
-            } else {
-                // We need to convert OpenAIChat → source (Anthropic).
-                let converter = &crate::converter::OpenAIChatToAnthropicConverter;
-                if let Some(ref ctx) = telemetry_ctx {
-                    converter.convert_response_with_ctx(&upstream_body_bytes, ctx.as_ref())
-                } else {
-                    converter.convert_response(&upstream_body_bytes, target, source, false)
+        (crate::converter::ApiType::OpenAIResponses, crate::converter::ApiType::OpenAIChat) => {
+            // /r2c/: target=Chat, upstream is Chat → convert Chat → Responses
+            let converter = &crate::converter::OpenAIResponsesToChatConverter;
+            converter.convert_response(&upstream_body_bytes, target, source, false)
+        }
+        (crate::converter::ApiType::OpenAIChat, crate::converter::ApiType::OpenAIResponses) => {
+            // /c2r/: target=Responses, upstream is Responses → convert Responses → Chat
+            let converter = &crate::converter::OpenAIChatToResponsesConverter;
+            converter.convert_response(&upstream_body_bytes, target, source, false)
+        }
+        // Chained conversions: Anthropic ↔ Responses via Chat intermediate
+        (crate::converter::ApiType::Anthropic, crate::converter::ApiType::OpenAIResponses) => {
+            // a2r: target=Responses, upstream is Responses → Responses → Chat → Anthropic
+            let step1 = crate::converter::OpenAIChatToResponsesConverter
+                .convert_response(&upstream_body_bytes, crate::converter::ApiType::OpenAIResponses, crate::converter::ApiType::OpenAIChat, false);
+            match step1 {
+                Ok(chat_bytes) => {
+                    crate::converter::AnthropicToOpenAIConverter
+                        .convert_response(&chat_bytes, crate::converter::ApiType::OpenAIChat, crate::converter::ApiType::Anthropic, false)
                 }
+                Err(e) => Err(e)
             }
         }
-        crate::converter::ApiType::OpenAIResponses => {
-            // target=OpenAIResponses means upstream response is in Responses format.
-            if source == crate::converter::ApiType::OpenAIChat {
-                // /c2r/: upstream Responses → Chat for client
-                let converter = &crate::converter::OpenAIChatToResponsesConverter;
-                converter.convert_response(&upstream_body_bytes, target, source, false)
-            } else {
-                // Unknown source, pass through
-                Ok(upstream_body_bytes.clone())
+        (crate::converter::ApiType::OpenAIResponses, crate::converter::ApiType::Anthropic) => {
+            // r2a: target=Anthropic, upstream is Anthropic → Anthropic → Chat → Responses
+            let step1 = crate::converter::AnthropicToOpenAIConverter
+                .convert_response(&upstream_body_bytes, crate::converter::ApiType::Anthropic, crate::converter::ApiType::OpenAIChat, false);
+            match step1 {
+                Ok(chat_bytes) => {
+                    crate::converter::OpenAIResponsesToChatConverter
+                        .convert_response(&chat_bytes, crate::converter::ApiType::OpenAIChat, crate::converter::ApiType::OpenAIResponses, false)
+                }
+                Err(e) => Err(e)
             }
         }
         _ => {
-            tracing::error!(target = ?target, "Unsupported target API type for response conversion");
-            // Pass through upstream body without conversion
+            tracing::error!(source = ?source, target = ?target, "Unsupported conversion direction for response");
             let body_str = std::str::from_utf8(&upstream_body_bytes).unwrap_or_else(|_| "[non-utf8]");
             return Ok(hyper::Response::builder()
                 .status(upstream_status)
                 .header("content-type", "application/json")
                 .header("X-Conversion-Status", "failed")
                 .header("X-Conversion-Phase", "response")
-                .header("X-Conversion-Error", "unsupported_target_api")
+                .header("X-Conversion-Error", "unsupported_conversion")
                 .body(full(body_str.to_string()))
                 .unwrap());
         }

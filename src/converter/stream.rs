@@ -16,6 +16,7 @@ enum StreamState {
     OpenAIToAnthropic(OAToAnState),
     AnthropicToOpenAI(AnToOAState),
     ChatToResponses(ChatToResponsesState),
+    ResponsesToChat(ResponsesToChatState),
 }
 
 struct OAToAnState {
@@ -90,6 +91,20 @@ struct ChatToResponsesState {
     finished: bool,
 }
 
+/// State machine for converting Responses API SSE → Chat Completion SSE.
+/// Inverse of ChatToResponsesState.
+struct ResponsesToChatState {
+    response_id: Option<String>,
+    model: Option<String>,
+    created: Option<u64>,
+    started: bool,
+    accumulated_text: String,
+    tool_calls: Vec<ToolCallState>,
+    finish_reason: Option<String>,
+    usage: Option<Value>,
+    finished: bool,
+}
+
 impl StreamConverter {
     pub fn new(source: ApiType, target: ApiType) -> Self {
         let state = match (source, target) {
@@ -101,6 +116,9 @@ impl StreamConverter {
             }
             (ApiType::OpenAIChat, ApiType::OpenAIResponses) => {
                 StreamState::ChatToResponses(ChatToResponsesState::new())
+            }
+            (ApiType::OpenAIResponses, ApiType::OpenAIChat) => {
+                StreamState::ResponsesToChat(ResponsesToChatState::new())
             }
             _ => panic!("Unsupported conversion direction for streaming: {:?} -> {:?}", source, target),
         };
@@ -159,6 +177,9 @@ impl StreamConverter {
             StreamState::ChatToResponses(state) => {
                 state.finalize()
             }
+            StreamState::ResponsesToChat(state) => {
+                state.finalize()
+            }
         }
     }
 
@@ -196,6 +217,9 @@ impl StreamConverter {
             }
             StreamState::ChatToResponses(state) => {
                 state.process_chat_event(&data_json)
+            }
+            StreamState::ResponsesToChat(state) => {
+                state.process_responses_event(&data_json)
             }
         }
     }
@@ -869,6 +893,195 @@ impl ChatToResponsesState {
         let empty = json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]});
         let result = self.process_chat_event(&empty)?;
         Ok(result.into_iter().collect())
+    }
+}
+
+impl ResponsesToChatState {
+    fn new() -> Self {
+        Self {
+            response_id: None,
+            model: None,
+            created: None,
+            started: false,
+            accumulated_text: String::new(),
+            tool_calls: Vec::new(),
+            finish_reason: None,
+            usage: None,
+            finished: false,
+        }
+    }
+
+    fn process_responses_event(&mut self, data: &Value) -> Result<Option<Bytes>, StreamError> {
+        if self.finished {
+            return Ok(None);
+        }
+
+        let event_type = data.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+        match event_type {
+            "response.created" | "response.in_progress" => {
+                // Extract metadata from the response object
+                let resp = data.get("response");
+                if self.response_id.is_none() {
+                    self.response_id = resp.and_then(|r| r.get("id")).and_then(|v| v.as_str()).map(String::from);
+                }
+                if self.model.is_none() {
+                    self.model = resp.and_then(|r| r.get("model")).and_then(|v| v.as_str()).map(String::from);
+                }
+                if self.created.is_none() {
+                    self.created = resp.and_then(|r| r.get("created_at")).and_then(|v| v.as_u64());
+                }
+
+                // On first event, emit the initial Chat SSE chunk with role
+                if !self.started {
+                    self.started = true;
+                    let id = self.response_id.clone().unwrap_or_else(|| "chatcmpl-unknown".to_string());
+                    let model = self.model.clone().unwrap_or_else(|| "unknown".to_string());
+                    let created = self.created.unwrap_or(0);
+                    let chunk = json!({
+                        "id": format!("chatcmpl-{}", id),
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model,
+                        "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": null}]
+                    });
+                    return Ok(Some(Bytes::from(format!("data: {}\n\n", chunk))));
+                }
+                Ok(None)
+            }
+            "response.output_text.delta" => {
+                // Text delta → Chat content delta
+                let delta_text = data.get("delta").and_then(|v| v.as_str()).unwrap_or("");
+                if !delta_text.is_empty() {
+                    self.accumulated_text.push_str(delta_text);
+                    let chunk = json!({
+                        "id": format!("chatcmpl-{}", self.response_id.clone().unwrap_or_default()),
+                        "object": "chat.completion.chunk",
+                        "created": self.created.unwrap_or(0),
+                        "model": self.model.clone().unwrap_or_else(|| "unknown".to_string()),
+                        "choices": [{"index": 0, "delta": {"content": delta_text}, "finish_reason": null}]
+                    });
+                    return Ok(Some(Bytes::from(format!("data: {}\n\n", chunk))));
+                }
+                Ok(None)
+            }
+            "response.output_item.done" => {
+                // Check if it's a function_call
+                if let Some(item) = data.get("item") {
+                    if item.get("type").and_then(|t| t.as_str()) == Some("function_call") {
+                        let id = item.get("call_id").or(item.get("id")).and_then(|v| v.as_str()).unwrap_or("");
+                        let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                        let args = item.get("arguments").and_then(|v| v.as_str()).unwrap_or("{}");
+                        self.tool_calls.push(ToolCallState {
+                            id: Some(id.to_string()),
+                            name: Some(name.to_string()),
+                            arguments_buffer: args.to_string(),
+                        });
+                    }
+                }
+                Ok(None)
+            }
+            "response.completed" => {
+                // Finalize: emit tool_calls and finish
+                self.finished = true;
+                let id = format!("chatcmpl-{}", self.response_id.clone().unwrap_or_default());
+                let model = self.model.clone().unwrap_or_else(|| "unknown".to_string());
+                let created = self.created.unwrap_or(0);
+                let mut output = String::new();
+
+                // Emit text delta if we have accumulated text and haven't streamed it yet
+                // (this handles the case where text comes via response.completed only)
+                // Actually, text deltas should have been streamed already via response.output_text.delta
+
+                // Emit tool_calls
+                for (idx, tc) in self.tool_calls.iter().enumerate() {
+                    // First chunk: id and function name
+                    let tc_chunk = json!({
+                        "id": id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model,
+                        "choices": [{"index": 0, "delta": {"tool_calls": [{"index": idx, "id": tc.id, "type": "function", "function": {"name": tc.name, "arguments": ""}}]}, "finish_reason": null}]
+                    });
+                    output.push_str(&format!("data: {}\n\n", tc_chunk));
+
+                    // Arguments chunk
+                    let args_chunk = json!({
+                        "id": id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model,
+                        "choices": [{"index": 0, "delta": {"tool_calls": [{"index": idx, "function": {"arguments": tc.arguments_buffer}}]}, "finish_reason": null}]
+                    });
+                    output.push_str(&format!("data: {}\n\n", args_chunk));
+                }
+
+                // Extract stop_reason and map to finish_reason
+                let stop_reason = data.get("response").and_then(|r| r.get("stop_reason")).and_then(|s| s.as_str());
+                let finish_reason = map_responses_stop_reason(stop_reason);
+
+                // Finish chunk
+                let finish_chunk = json!({
+                    "id": id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}]
+                });
+                output.push_str(&format!("data: {}\n\n", finish_chunk));
+                output.push_str("data: [DONE]\n\n");
+
+                Ok(Some(Bytes::from(output)))
+            }
+            _ => {
+                // Other events (content_part.added, etc.) — ignore
+                Ok(None)
+            }
+        }
+    }
+
+    fn finalize(&mut self) -> Result<Vec<Bytes>, StreamError> {
+        if self.finished {
+            return Ok(vec![]);
+        }
+        self.finished = true;
+        let id = format!("chatcmpl-{}", self.response_id.clone().unwrap_or_default());
+        let model = self.model.clone().unwrap_or_else(|| "unknown".to_string());
+        let created = self.created.unwrap_or(0);
+        let mut output = String::new();
+
+        // Emit any remaining tool calls
+        for (idx, tc) in self.tool_calls.iter().enumerate() {
+            let tc_chunk = json!({
+                "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
+                "choices": [{"index": 0, "delta": {"tool_calls": [{"index": idx, "id": tc.id, "type": "function", "function": {"name": tc.name, "arguments": ""}}]}, "finish_reason": null}]
+            });
+            output.push_str(&format!("data: {}\n\n", tc_chunk));
+            let args_chunk = json!({
+                "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
+                "choices": [{"index": 0, "delta": {"tool_calls": [{"index": idx, "function": {"arguments": tc.arguments_buffer}}]}, "finish_reason": null}]
+            });
+            output.push_str(&format!("data: {}\n\n", args_chunk));
+        }
+
+        let finish_chunk = json!({
+            "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": if self.tool_calls.is_empty() { "stop" } else { "tool_calls" } }]
+        });
+        output.push_str(&format!("data: {}\n\n", finish_chunk));
+        output.push_str("data: [DONE]\n\n");
+        Ok(vec![Bytes::from(output)])
+    }
+}
+
+fn map_responses_stop_reason(reason: Option<&str>) -> &'static str {
+    match reason {
+        Some("end_turn") => "stop",
+        Some("max_tokens") => "length",
+        Some("tool_use") => "tool_calls",
+        Some("stop_sequence") => "stop",
+        Some("content_filter") => "content_filter",
+        _ => "stop",
     }
 }
 
