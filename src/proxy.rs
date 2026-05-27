@@ -748,6 +748,28 @@ pub async fn conversion_proxy_handler(
     let path = req.uri().path().to_string();
     let method = req.method().clone();
 
+    // Handle GET /v1/models — Codex calls this on startup
+    if method == hyper::Method::GET && (path.ends_with("/models") || path.ends_with("/models/")) {
+        let models = state.provider_manager.get_all_models();
+        let data: Vec<serde_json::Value> = models.into_iter().map(|(model_id, provider_name)| {
+            serde_json::json!({
+                "id": model_id,
+                "object": "model",
+                "created": 0,
+                "owned_by": provider_name,
+            })
+        }).collect();
+        let body = serde_json::json!({
+            "object": "list",
+            "data": data,
+        });
+        return Ok(hyper::Response::builder()
+            .status(hyper::StatusCode::OK)
+            .header("content-type", "application/json")
+            .body(full(serde_json::to_string(&body).unwrap()))
+            .unwrap());
+    }
+
     // Generate request ID for telemetry
     let request_id = generate_request_id();
 
@@ -786,11 +808,17 @@ pub async fn conversion_proxy_handler(
             }
         }
         crate::converter::ApiType::OpenAIChat => {
-            let converter = &crate::converter::OpenAIChatToAnthropicConverter;
-            if let Some(ref ctx) = telemetry_ctx {
-                converter.convert_request_with_ctx(&body_bytes, ctx.as_ref())
-            } else {
+            if target == crate::converter::ApiType::OpenAIResponses {
+                // /c2r/: Chat → Responses request conversion
+                let converter = &crate::converter::OpenAIChatToResponsesConverter;
                 converter.convert_request(&body_bytes, target)
+            } else {
+                let converter = &crate::converter::OpenAIChatToAnthropicConverter;
+                if let Some(ref ctx) = telemetry_ctx {
+                    converter.convert_request_with_ctx(&body_bytes, ctx.as_ref())
+                } else {
+                    converter.convert_request(&body_bytes, target)
+                }
             }
         }
         crate::converter::ApiType::OpenAIResponses => {
@@ -984,13 +1012,12 @@ pub async fn conversion_proxy_handler(
         return Ok(hyper::Response::from_parts(parts, body));
     }
 
-    // For Responses→Chat conversion with SSE upstream: buffer the stream,
-    // extract the final Chat completion JSON, convert it, and return as
-    // a Responses API SSE event stream.
+    // For Responses→Chat conversion with SSE upstream: use true streaming.
+    // Convert Chat SSE deltas → Responses SSE events on-the-fly.
     if upstream_is_sse && source == crate::converter::ApiType::OpenAIResponses {
-        tracing::info!(request_id = %request_id, "Buffering upstream SSE for Responses→Chat conversion");
+        tracing::info!(request_id = %request_id, "True streaming for Responses→Chat conversion");
 
-        // Check for error response before buffering
+        // Check for error response before streaming
         if !upstream_status.is_success() {
             let error_data = upstream_resp.collect().await
                 .map_err(|e| crate::error::ProxyError::HttpError(e.to_string()))?
@@ -1025,203 +1052,33 @@ pub async fn conversion_proxy_handler(
                 .unwrap());
         }
 
-        let sse_data = upstream_resp.collect().await
-            .map_err(|e| crate::error::ProxyError::HttpError(e.to_string()))?
-            .to_bytes();
-        let sse_str = String::from_utf8_lossy(&sse_data);
+        // True streaming: Chat SSE → Responses SSE via StreamConverter
+        let stream_converter = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::converter::stream::StreamConverter::new(
+                crate::converter::ApiType::OpenAIChat,
+                crate::converter::ApiType::OpenAIResponses,
+            )
+        ));
 
-        // Parse SSE chunks: accumulate content from delta chunks,
-        // find the final chunk with finish_reason, and build a complete response.
-        let mut accumulated_content = String::new();
-        let mut accumulated_reasoning = String::new();
-        let mut response_id: Option<String> = None;
-        let mut model: Option<String> = None;
-        let mut created: Option<u64> = None;
-        let mut finish_reason: Option<String> = None;
-        let mut usage: Option<serde_json::Value> = None;
+        let (mut parts, upstream_body) = upstream_resp.into_parts();
+        parts.headers.insert(
+            hyper::header::HeaderName::from_static("x-conversion-status"),
+            hyper::header::HeaderValue::from_static("success"),
+        );
+        parts.headers.insert(
+            hyper::header::HeaderName::from_static("content-type"),
+            hyper::header::HeaderValue::from_static("text/event-stream"),
+        );
+        parts.headers.insert(
+            hyper::header::HeaderName::from_static("cache-control"),
+            hyper::header::HeaderValue::from_static("no-cache"),
+        );
 
-        for line in sse_str.lines() {
-            let line = line.trim();
-            if let Some(json_str) = line.strip_prefix("data:") {
-                let json_str = json_str.trim();
-                if json_str == "[DONE]" { continue; }
-                if let Ok(chunk) = serde_json::from_str::<serde_json::Value>(json_str) {
-                    if response_id.is_none() {
-                        response_id = chunk.get("id").and_then(|v| v.as_str()).map(String::from);
-                    }
-                    if model.is_none() {
-                        model = chunk.get("model").and_then(|v| v.as_str()).map(String::from);
-                    }
-                    if created.is_none() {
-                        created = chunk.get("created").and_then(|v| v.as_u64());
-                    }
-                    if let Some(u) = chunk.get("usage") {
-                        usage = Some(u.clone());
-                    }
-                    if let Some(choices) = chunk.get("choices").and_then(|c| c.as_array()) {
-                        for choice in choices {
-                            // Accumulate content from delta
-                            if let Some(delta) = choice.get("delta") {
-                                if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
-                                    accumulated_content.push_str(content);
-                                }
-                                if let Some(reasoning) = delta.get("reasoning_content").and_then(|r| r.as_str()) {
-                                    accumulated_reasoning.push_str(reasoning);
-                                }
-                            }
-                            // Also check message.content for non-streaming chunks
-                            if let Some(message) = choice.get("message") {
-                                if let Some(content) = message.get("content").and_then(|c| c.as_str()) {
-                                    accumulated_content.push_str(content);
-                                }
-                                if let Some(reasoning) = message.get("reasoning_content").and_then(|r| r.as_str()) {
-                                    accumulated_reasoning.push_str(reasoning);
-                                }
-                            }
-                            // Track finish_reason
-                            if let Some(fr) = choice.get("finish_reason").and_then(|f| f.as_str()) {
-                                finish_reason = Some(fr.to_string());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Build a complete Chat Completion response from accumulated data
-        let complete_response = serde_json::json!({
-            "id": response_id.unwrap_or_else(|| "chatcmpl-unknown".to_string()),
-            "object": "chat.completion",
-            "created": created.unwrap_or(0),
-            "model": model.unwrap_or_else(|| "unknown".to_string()),
-            "choices": [{
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": if accumulated_content.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(accumulated_content) },
-                    "reasoning_content": if accumulated_reasoning.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(accumulated_reasoning) }
-                },
-                "finish_reason": finish_reason.as_deref().unwrap_or("stop")
-            }],
-            "usage": usage.map(|u| {
-                let prompt = u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                let completion = u.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                serde_json::json!({
-                    "prompt_tokens": prompt,
-                    "completion_tokens": completion,
-                    "total_tokens": prompt + completion
-                })
-            }).unwrap_or_else(|| serde_json::json!({"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}))
-        });
-
-        // Convert the complete Chat response to Responses format
-        let chunk_bytes = bytes::Bytes::from(serde_json::to_vec(&complete_response).unwrap());
-        let converted = {
-            let converter = &crate::converter::OpenAIResponsesToChatConverter;
-            converter.convert_response(&chunk_bytes, target, source, false)
-        };
-
-        let converted = match converted {
-            Ok(resp) => resp,
-            Err(conv_err) => {
-                tracing::warn!(request_id = %request_id, error = ?conv_err, "SSE chunk conversion failed");
-                return Err(crate::error::ProxyError::HttpError(conv_err.to_string()));
-            }
-        };
-
-        // Build Responses API SSE event stream
-        let resp: serde_json::Value = serde_json::from_slice(&converted).unwrap_or_default();
-
-        let mut sse = String::new();
-        // response.created and response.in_progress wrap the response in a "response" field
-        let created_event = serde_json::json!({"type": "response.created", "response": resp});
-        let in_progress_event = serde_json::json!({"type": "response.in_progress", "response": &resp});
-        sse.push_str(&format!("event: response.created\ndata: {}\n\n", created_event));
-        sse.push_str(&format!("event: response.in_progress\ndata: {}\n\n", in_progress_event));
-
-        if let Some(output) = resp.get("output").and_then(|o| o.as_array()) {
-            for (idx, item) in output.iter().enumerate() {
-                // output_item.added wraps item in {type, output_index, item}
-                let added_event = serde_json::json!({
-                    "type": "response.output_item.added",
-                    "output_index": idx,
-                    "item": item
-                });
-                sse.push_str(&format!("event: response.output_item.added\ndata: {}\n\n", added_event));
-
-                if let Some(content) = item.get("content").and_then(|c| c.as_array()) {
-                    for (part_idx, part) in content.iter().enumerate() {
-                        let part_added = serde_json::json!({
-                            "type": "response.content_part.added",
-                            "output_index": idx,
-                            "content_index": part_idx,
-                            "part": part
-                        });
-                        sse.push_str(&format!("event: response.content_part.added\ndata: {}\n\n", part_added));
-
-                        if part.get("type").and_then(|t| t.as_str()) == Some("output_text") {
-                            let text = part.get("text").and_then(|t| t.as_str()).unwrap_or("");
-                            let delta = serde_json::json!({
-                                "type": "response.output_text.delta",
-                                "output_index": idx,
-                                "content_index": part_idx,
-                                "delta": text
-                            });
-                            sse.push_str(&format!("event: response.output_text.delta\ndata: {}\n\n", delta));
-                            let done = serde_json::json!({
-                                "type": "response.output_text.done",
-                                "output_index": idx,
-                                "content_index": part_idx,
-                                "text": text
-                            });
-                            sse.push_str(&format!("event: response.output_text.done\ndata: {}\n\n", done));
-                        }
-
-                        let part_done = serde_json::json!({
-                            "type": "response.content_part.done",
-                            "output_index": idx,
-                            "content_index": part_idx,
-                            "part": part
-                        });
-                        sse.push_str(&format!("event: response.content_part.done\ndata: {}\n\n", part_done));
-                    }
-                }
-
-                let item_done = serde_json::json!({
-                    "type": "response.output_item.done",
-                    "output_index": idx,
-                    "item": item
-                });
-                sse.push_str(&format!("event: response.output_item.done\ndata: {}\n\n", item_done));
-            }
-        }
-
-        let completed_event = serde_json::json!({"type": "response.completed", "response": resp});
-        sse.push_str(&format!("event: response.completed\ndata: {}\n\n", completed_event));
-
-        let sse_bytes = bytes::Bytes::from(sse);
-        let stream = futures_util::stream::once(async move {
-            Ok::<_, hyper::Error>(hyper::body::Frame::data(sse_bytes))
-        });
-        let stream_body = http_body_util::StreamBody::new(stream);
-        return Ok(hyper::Response::builder()
-            .status(upstream_status)
-            .header("content-type", "text/event-stream")
-            .header("cache-control", "no-cache")
-            .header("X-Conversion-Status", "success")
-            .body(BoxBody::new(stream_body))
-            .unwrap());
+        let conversion_body = ConversionStreamBody::new(upstream_body, stream_converter);
+        return Ok(hyper::Response::from_parts(parts, BoxBody::new(conversion_body)));
     }
 
     if upstream_is_sse {
-        // Guard: StreamConverter only supports OpenAIChat <-> Anthropic.
-        // Responses→Chat SSE is handled by the buffer path above.
-        if source == crate::converter::ApiType::OpenAIResponses || target == crate::converter::ApiType::OpenAIResponses {
-            tracing::error!(source = ?source, target = ?target, "SSE streaming not supported for Responses API conversion direction");
-            return Err(crate::error::ProxyError::HttpError(
-                "SSE streaming not supported for this conversion direction".to_string()
-            ));
-        }
 
         // True streaming conversion using ConversionStreamBody
         tracing::info!(source = ?source, target = ?target, "Converting streaming response");
@@ -1294,6 +1151,17 @@ pub async fn conversion_proxy_handler(
                 } else {
                     converter.convert_response(&upstream_body_bytes, target, source, false)
                 }
+            }
+        }
+        crate::converter::ApiType::OpenAIResponses => {
+            // target=OpenAIResponses means upstream response is in Responses format.
+            if source == crate::converter::ApiType::OpenAIChat {
+                // /c2r/: upstream Responses → Chat for client
+                let converter = &crate::converter::OpenAIChatToResponsesConverter;
+                converter.convert_response(&upstream_body_bytes, target, source, false)
+            } else {
+                // Unknown source, pass through
+                Ok(upstream_body_bytes.clone())
             }
         }
         _ => {

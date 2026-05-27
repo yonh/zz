@@ -400,6 +400,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
 
                             // Handle regular proxy request (/v1/*)
+                            // GET /v1/models — Codex calls this on startup
+                            if req.method() == hyper::Method::GET && (path == "/v1/models" || path == "/v1/models/") {
+                                let models = state.provider_manager.get_all_models();
+                                let data: Vec<serde_json::Value> = models.into_iter().map(|(model_id, provider_name)| {
+                                    serde_json::json!({
+                                        "id": model_id,
+                                        "object": "model",
+                                        "created": 0,
+                                        "owned_by": provider_name,
+                                    })
+                                }).collect();
+                                let body = serde_json::json!({
+                                    "object": "list",
+                                    "data": data,
+                                });
+                                return Ok::<_, hyper::Error>(hyper::Response::builder()
+                                    .status(hyper::StatusCode::OK)
+                                    .header("content-type", "application/json")
+                                    .body(full(serde_json::to_string(&body).unwrap()))
+                                    .unwrap());
+                            }
+
                             // Check for Claude Code compatibility mode first
                             let should_use_compat = {
                                 let config = state.config.read().unwrap();

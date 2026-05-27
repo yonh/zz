@@ -373,6 +373,26 @@ impl ProviderManager {
             .collect()
     }
 
+    /// Get all models from all enabled providers, deduplicated.
+    /// Returns (model_id, provider_name) pairs.
+    pub fn get_all_models(&self) -> Vec<(String, String)> {
+        let mut models = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for entry in self.providers.iter() {
+            let provider = entry.value();
+            if !provider.is_enabled() {
+                continue;
+            }
+            let config = provider.config.read().unwrap();
+            for model in &config.models {
+                if seen.insert(model.clone()) {
+                    models.push((model.clone(), config.name.clone()));
+                }
+            }
+        }
+        models
+    }
+
     pub fn get_total_stats(&self) -> (u64, u64) {
         let mut total_requests = 0u64;
         let mut total_errors = 0u64;

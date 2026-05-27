@@ -197,11 +197,13 @@ pub trait ApiConverter: Send + Sync {
 pub mod anthropic_to_openai;
 pub mod known_fields;
 pub mod openai_to_anthropic;
+pub mod openai_chat_to_responses;
 pub mod openai_responses_to_chat;
 pub mod stream;
 pub mod telemetry;
 pub use anthropic_to_openai::AnthropicToOpenAIConverter;
 pub use openai_to_anthropic::OpenAIChatToAnthropicConverter;
+pub use openai_chat_to_responses::OpenAIChatToResponsesConverter;
 pub use openai_responses_to_chat::OpenAIResponsesToChatConverter;
 pub use stream::StreamConverter;
 pub use telemetry::{TelemetryContext, NoopTelemetry};
