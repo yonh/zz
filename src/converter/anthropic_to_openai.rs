@@ -334,6 +334,7 @@ impl AnthropicToOpenAIConverter {
             if let Some(content_arr) = content.and_then(|c| c.as_array()) {
                 let mut tool_results = Vec::new();
                 let mut non_tool_content = Vec::new();
+                let mut tool_calls = Vec::new();
 
                 for (j, block) in content_arr.iter().enumerate() {
                     if let Some(block_obj) = block.as_object() {
@@ -373,7 +374,7 @@ impl AnthropicToOpenAIConverter {
                             );
                             tool_result_index += 1;
                         } else if block_type == Some("tool_use") {
-                            // tool_use in user message - convert to tool_calls
+                            // tool_use → OpenAI tool_calls
                             let id = block_obj
                                 .get("id")
                                 .and_then(|id| id.as_str())
@@ -409,17 +410,13 @@ impl AnthropicToOpenAIConverter {
 
                             let input = block_obj.get("input").cloned().unwrap_or_else(|| json!({}));
 
-                            non_tool_content.push(json!({
-                                "role": role,
-                                "content": Value::Null,
-                                "tool_calls": [{
-                                    "id": id,
-                                    "type": "function",
-                                    "function": {
-                                        "name": name,
-                                        "arguments": serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_string())
-                                    }
-                                }]
+                            tool_calls.push(json!({
+                                "id": id,
+                                "type": "function",
+                                "function": {
+                                    "name": name,
+                                    "arguments": serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_string())
+                                }
                             }));
                         } else if block_type == Some("text") {
                             if let Some(text) = block_obj.get("text").and_then(|t| t.as_str()) {
@@ -444,30 +441,28 @@ impl AnthropicToOpenAIConverter {
                     result.push(tr);
                 }
 
-                // Add non-tool content
-                if !non_tool_content.is_empty() {
-                    let msg_value = if non_tool_content.len() == 1 {
-                        // Single string content
+                // Add non-tool content and tool_calls
+                if !non_tool_content.is_empty() || !tool_calls.is_empty() {
+                    let mut msg = json!({});
+                    msg["role"] = json!(role);
+
+                    if non_tool_content.is_empty() {
+                        msg["content"] = Value::Null;
+                    } else if non_tool_content.len() == 1 {
                         if let Some(s) = non_tool_content.first().and_then(|v| v.as_str()) {
-                            json!({
-                                "role": role,
-                                "content": s
-                            })
+                            msg["content"] = json!(s);
                         } else {
-                            // It's an object (image or tool_calls)
-                            json!({
-                                "role": role,
-                                "content": non_tool_content
-                            })
+                            msg["content"] = json!(non_tool_content);
                         }
                     } else {
-                        // Multiple blocks - use array
-                        json!({
-                            "role": role,
-                            "content": non_tool_content
-                        })
-                    };
-                    result.push(msg_value);
+                        msg["content"] = json!(non_tool_content);
+                    }
+
+                    if !tool_calls.is_empty() {
+                        msg["tool_calls"] = json!(tool_calls);
+                    }
+
+                    result.push(msg);
                 }
             } else if let Some(content_str) = content.and_then(|c| c.as_str()) {
                 // Simple string content
